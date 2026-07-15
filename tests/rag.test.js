@@ -5,7 +5,9 @@ import {
   buildGroundingContext,
   createSources,
   extractSections,
+  isDocumentWideQuestion,
   retrieveChunks,
+  selectDocumentCoverage,
   tokenize,
 } from "../lib/rag.js";
 
@@ -88,11 +90,46 @@ test("structure-aware chunking preserves definitions, lists, tables and code", (
     }],
   };
   const { chunks } = buildDocumentIndex(ast, { name: "os.pptx" });
-  const types = new Set(chunks.map((chunk) => chunk.contentType));
+  const types = new Set(chunks.flatMap((chunk) => chunk.structureTypes));
+  assert.equal(chunks.length, 1);
   assert(types.has("definition"));
   assert(types.has("list"));
   assert(types.has("table"));
   assert(types.has("code"));
+});
+
+test("short slide pages stay intact instead of exhausting the document chunk limit", () => {
+  const ast = {
+    content: Array.from({ length: 57 }, (_, index) => ({
+      type: "page",
+      metadata: { pageNumber: index + 1 },
+      text: `第 ${index + 1} 页\n• 定义与背景\n• 机制与实现\n• 示例与比较`,
+    })),
+  };
+  const index = buildDocumentIndex(ast, { name: "threads.pdf" });
+  assert.equal(index.chunks.length, 57);
+  assert.equal(index.chunks.at(-1).number, 57);
+  assert.equal(index.truncated, false);
+});
+
+test("whole-document questions use ordered document coverage", () => {
+  assert.equal(isDocumentWideQuestion("请先概览这份课件的知识结构。", "explain"), true);
+  assert.equal(isDocumentWideQuestion("请详细讲解一下这节课的内容。", "explain"), true);
+  assert.equal(isDocumentWideQuestion("线程控制块是什么？", "qa"), false);
+  const chunks = Array.from({ length: 56 }, (_, index) => ({
+    id: `page-${index + 1}`,
+    fileName: "threads.pdf",
+    kind: "page",
+    number: index + 1,
+    label: `第 ${index + 1} 页`,
+    title: `主题 ${index + 1}`,
+    contentType: "list",
+    text: `第 ${index + 1} 页的课程内容`,
+  }));
+  const selected = selectDocumentCoverage(chunks);
+  assert.equal(selected.length, 56);
+  assert.equal(selected[0].number, 1);
+  assert.equal(selected.at(-1).number, 56);
 });
 
 test("semantic vectors can recall a chunk without keyword overlap", () => {

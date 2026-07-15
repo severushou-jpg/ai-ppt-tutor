@@ -2,9 +2,12 @@ import { NextResponse } from "next/server";
 import {
   buildGroundingContext,
   createSources,
+  DOCUMENT_INDEX_VERSION,
   expandWithAdjacentChunks,
+  isDocumentWideQuestion,
   normalizeWhitespace,
   retrieveChunks,
+  selectDocumentCoverage,
 } from "@/lib/rag.js";
 import { embedTexts, rerankChunks } from "@/lib/dashscope-retrieval.js";
 import {
@@ -29,6 +32,21 @@ const MODE_INSTRUCTIONS = {
   quiz: `生成 5 道由基础到应用的题目。题目放在 quiz.question，答案和解析分别放在 quiz.answer 与 quiz.explanation，不要在题目中泄露答案。每道解析必须绑定来源。`,
   review: `组织为知识结构、高频重点、易混淆点和可执行复习顺序。控制在便于考前复习的长度。`,
 };
+
+const DOCUMENT_WIDE_INSTRUCTION = `这是整份课件任务，不是局部关键词问答。你收到的是按原始页码排列的课件全文覆盖证据。
+- 先识别课程主线，再按课件实际顺序覆盖所有主要主题，不要只围绕与提问字面最相似的几页。
+- “知识结构/概览”应说明主题层级、前后关系和各部分解决的问题。
+- “详细讲解”应覆盖定义、机制、实现模型、比较、示例和总结；允许较长，但避免逐页复述。
+- 不得因为某个概念没有出现在少数来源中就断言整份课件未提及；必须检查全部给定证据。
+- 每个主要主题至少绑定一条直接支持它的引用。`;
+
+function documentWideTaskInstruction(question, mode) {
+  if (mode !== "explain") return MODE_INSTRUCTIONS[mode];
+  if (/概览|知识结构|内容结构|整体框架|课程框架|outline|overview/i.test(question)) {
+    return `输出真正的知识结构图谱：使用 6-8 个 sections，每个 section 对应一个实际课程模块；按课件顺序说明模块主题、核心问题以及它与前后模块的关系。不要把所有内容压缩到一个“知识结构概览”小节，也不要只罗列标题。`;
+  }
+  return `进行整课详细讲解：使用 6-8 个 sections，按课件顺序为每个实际主题模块分别讲清定义、工作机制、重要比较、实现方式和课件例子。不要用“学习目标/核心讲解/例子”三个通用大框笼统容纳整份课件，也不要逐页复述。最后可增加一个易错点与复习主线小节。`;
+}
 
 function jsonResponse(body, status = 200) {
   return NextResponse.json(body, {
@@ -85,12 +103,20 @@ function parsePayload(payload) {
   const question = normalizeWhitespace(payload?.question).slice(0, MAX_QUESTION_LENGTH);
   const mode = VALID_MODES.has(payload?.mode) ? payload.mode : "qa";
   if (!question) return { error: { code: "QUESTION_REQUIRED", message: "请输入你想学习的内容。" } };
+  if (payload?.document && Number(payload.document.indexVersion) !== DOCUMENT_INDEX_VERSION) {
+    return {
+      error: {
+        code: "REINDEX_REQUIRED",
+        message: "检索索引已经升级，请重新上传课件后再提问。",
+      },
+    };
+  }
   const document = parseDocument(payload?.document);
   if (!document) return { error: { code: "DOCUMENT_REQUIRED", message: "请先上传并完成课件解析。" } };
   return { question, mode, document, history: parseHistory(payload?.history) };
 }
 
-function buildSystemMessage(mode, groundingContext, sources) {
+function buildSystemMessage(mode, groundingContext, sources, options = {}) {
   const allowedIds = sources.map((source) => source.id);
   return `你是一位严谨的大学课程助教。请只输出一个有效 JSON 对象，不要输出 Markdown 代码围栏或 JSON 之外的文字。
 
@@ -103,7 +129,10 @@ function buildSystemMessage(mode, groundingContext, sources) {
 6. summary 只写一句任务导向概述，不在其中新增事实。
 7. 使用中文。回答长度与问题难度匹配：简单问答简洁，讲解和复习可以更详细。
 
-任务要求：${MODE_INSTRUCTIONS[mode]}
+任务要求：${options.documentWide
+    ? documentWideTaskInstruction(options.question ?? "", mode)
+    : MODE_INSTRUCTIONS[mode]}
+${options.documentWide ? `\n${DOCUMENT_WIDE_INSTRUCTION}\n本次证据覆盖 ${options.selectedPageCount}/${options.indexedPageCount} 个有文本页面。` : ""}
 
 严格使用以下结构：
 {
@@ -135,7 +164,7 @@ function buildSystemMessage(mode, groundingContext, sources) {
 ${groundingContext}`;
 }
 
-async function callDashScope(messages, apiKey, requestSignal) {
+async function callDashScope(messages, apiKey, requestSignal, options = {}) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort("timeout"), 45_000);
   const abortFromClient = () => controller.abort("client-aborted");
@@ -153,6 +182,7 @@ async function callDashScope(messages, apiKey, requestSignal) {
             result_format: "message",
             response_format: { type: "json_object" },
             temperature: 0.15,
+            max_tokens: options.documentWide ? 6_000 : 3_000,
           },
         }),
         signal: controller.signal,
@@ -201,6 +231,22 @@ function refusalResponse(message, retrieval) {
 }
 
 async function retrieveEvidence(parsed, apiKey, signal) {
+  const documentWide = isDocumentWideQuestion(parsed.question, parsed.mode);
+  const indexedPageCount = new Set(
+    parsed.document.chunks.map((chunk) => `${chunk.kind}:${chunk.number}`),
+  ).size;
+  if (documentWide) {
+    const chunks = selectDocumentCoverage(parsed.document.chunks);
+    return {
+      chunks,
+      embeddingUsed: parsed.document.retrievalMode === "hybrid",
+      rerankUsed: false,
+      documentWide: true,
+      indexedPageCount,
+      selectedPageCount: new Set(chunks.map((chunk) => `${chunk.kind}:${chunk.number}`)).size,
+    };
+  }
+
   let queryEmbedding = null;
   let embeddingUsed = false;
   if (apiKey && parsed.document.chunks.some((chunk) => chunk.embedding)) {
@@ -219,7 +265,10 @@ async function retrieveEvidence(parsed, apiKey, signal) {
     topK: 12,
     queryEmbedding,
   });
-  if (candidates.length === 0) return { chunks: [], embeddingUsed, rerankUsed: false };
+  if (candidates.length === 0) return {
+    chunks: [], embeddingUsed, rerankUsed: false, documentWide: false,
+    indexedPageCount, selectedPageCount: 0,
+  };
 
   let ranked = candidates;
   let rerankUsed = false;
@@ -238,12 +287,19 @@ async function retrieveEvidence(parsed, apiKey, signal) {
   if (parsed.mode === "qa" && rerankUsed) {
     ranked = ranked.filter((chunk) => chunk.rerankScore >= 0.12);
   }
-  if (ranked.length === 0) return { chunks: [], embeddingUsed, rerankUsed };
+  if (ranked.length === 0) return {
+    chunks: [], embeddingUsed, rerankUsed, documentWide: false,
+    indexedPageCount, selectedPageCount: 0,
+  };
 
+  const chunks = expandWithAdjacentChunks(ranked.slice(0, 5), parsed.document.chunks, 6);
   return {
-    chunks: expandWithAdjacentChunks(ranked.slice(0, 5), parsed.document.chunks, 6),
+    chunks,
     embeddingUsed,
     rerankUsed,
+    documentWide: false,
+    indexedPageCount,
+    selectedPageCount: new Set(chunks.map((chunk) => `${chunk.kind}:${chunk.number}`)).size,
   };
 }
 
@@ -263,6 +319,9 @@ export async function POST(request) {
       mode: evidence.embeddingUsed ? "hybrid" : "lexical",
       reranked: evidence.rerankUsed,
       candidateCount: evidence.chunks.length,
+      strategy: evidence.documentWide ? "document_coverage" : "focused",
+      indexedPageCount: evidence.indexedPageCount,
+      selectedPageCount: evidence.selectedPageCount,
     };
 
     if (parsed.mode === "qa" && evidence.chunks.length === 0) {
@@ -277,11 +336,21 @@ export async function POST(request) {
 
     const sources = createSources(evidence.chunks, parsed.question);
     const messages = [
-      { role: "system", content: buildSystemMessage(parsed.mode, buildGroundingContext(evidence.chunks), sources) },
+      {
+        role: "system",
+        content: buildSystemMessage(parsed.mode, buildGroundingContext(evidence.chunks), sources, {
+          documentWide: evidence.documentWide,
+          question: parsed.question,
+          indexedPageCount: evidence.indexedPageCount,
+          selectedPageCount: evidence.selectedPageCount,
+        }),
+      },
       ...parsed.history,
       { role: "user", content: `${parsed.question}\n\n请按照 JSON 格式输出。` },
     ];
-    const modelContent = await callDashScope(messages, apiKey, request.signal);
+    const modelContent = await callDashScope(messages, apiKey, request.signal, {
+      documentWide: evidence.documentWide,
+    });
     const structured = parseStructuredResponse(modelContent, sources, parsed.mode);
     if (!structured) {
       const error = new Error("模型返回格式异常，请重试。");

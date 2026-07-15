@@ -52,6 +52,7 @@ import type {
 import { clearWorkspace, loadWorkspace, saveWorkspace } from "@/lib/client-storage";
 
 const MAX_FILE_BYTES = 20 * 1024 * 1024;
+const CURRENT_DOCUMENT_INDEX_VERSION = 2;
 
 const MODES: Record<
   LearningMode,
@@ -241,8 +242,10 @@ function MessageCard({
       )}
       <div className="flex items-center justify-between border-t border-slate-100 px-5 py-2.5">
         <span className="text-[11px] text-slate-400">
-          {message.retrieval?.mode === "hybrid" ? "关键词＋语义检索" : "关键词检索"}
-          {message.retrieval?.reranked ? " · 已重排序" : ""}
+          {message.retrieval?.strategy === "document_coverage"
+            ? `全文覆盖 · ${message.retrieval.selectedPageCount ?? message.retrieval.candidateCount}/${message.retrieval.indexedPageCount ?? message.retrieval.candidateCount} 页`
+            : message.retrieval?.mode === "hybrid" ? "关键词＋语义检索" : "关键词检索"}
+          {message.retrieval?.strategy !== "document_coverage" && message.retrieval?.reranked ? " · 已重排序" : ""}
         </span>
         <div className="flex items-center gap-1" aria-label="回答反馈">
           <button type="button" onClick={() => onFeedback(message.id, "helpful")} aria-label="回答有帮助" className={`rounded-lg p-1.5 transition ${message.feedback === "helpful" ? "bg-emerald-50 text-emerald-700" : "text-slate-400 hover:bg-slate-50 hover:text-slate-700"}`}><ThumbsUp size={14} /></button>
@@ -338,6 +341,7 @@ export default function Home() {
   const [uploadPhase, setUploadPhase] = useState<UploadPhase>("idle");
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadDetail, setUploadDetail] = useState<{ current: number; total: number | null; message: string } | null>(null);
+  const [retryAvailable, setRetryAvailable] = useState(false);
   const [uploadError, setUploadError] = useState<ApiError | null>(null);
   const [requestError, setRequestError] = useState<string | null>(null);
   const [mode, setMode] = useState<LearningMode>("explain");
@@ -373,6 +377,18 @@ export default function Home() {
     void loadWorkspace()
       .then((snapshot) => {
         if (cancelled || !snapshot || snapshot.version !== 1) return;
+        if (snapshot.documentIndex && snapshot.documentIndex.indexVersion !== CURRENT_DOCUMENT_INDEX_VERSION) {
+          setDocumentIndex(null);
+          setMessages([]);
+          setActiveSources([]);
+          setSelectedSourceId(null);
+          setUploadError({
+            code: "REINDEX_REQUIRED",
+            message: "检索算法已升级，请重新上传课件。旧回答已清除，以免继续显示不完整结果。",
+          });
+          setUploadPhase("error");
+          return;
+        }
         setDocumentIndex(snapshot.documentIndex);
         setMessages(snapshot.messages);
         setMode(snapshot.mode);
@@ -423,6 +439,7 @@ export default function Home() {
 
   const processDocument = (file: File) => {
     lastUploadFileRef.current = file;
+    setRetryAvailable(true);
     const extension = file.name.toLowerCase().split(".").pop();
     if (!extension || !["pdf", "pptx"].includes(extension)) {
       setUploadError({ code: "UNSUPPORTED_FORMAT", message: "暂不支持该格式，请上传 PDF 或 PPTX。" });
@@ -661,6 +678,7 @@ export default function Home() {
     setSelectedSourceId(null);
     setUploadError(null);
     setUploadPhase("idle");
+    setRetryAvailable(false);
     setMobileTab("files");
     void clearWorkspace();
   };
@@ -773,7 +791,7 @@ export default function Home() {
                   </button>
                 </div>
               )}
-              {uploadPhase === "error" && (
+              {uploadPhase === "error" && retryAvailable && (
                 <button
                   type="button"
                   onClick={(event) => {

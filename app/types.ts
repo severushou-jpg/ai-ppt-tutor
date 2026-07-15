@@ -16,12 +16,14 @@ export interface DocumentChunk {
   label: string;
   title: string;
   contentType: "prose" | "heading" | "definition" | "list" | "table" | "code";
+  structureTypes?: Array<"prose" | "definition" | "list" | "table" | "code">;
   text: string;
   embedding?: number[];
 }
 
 export interface DocumentIndex {
   id: string;
+  indexVersion: number;
   name: string;
   extension: string;
   size: number;
@@ -74,6 +76,9 @@ export interface RetrievalMetadata {
   mode: "lexical" | "hybrid";
   reranked: boolean;
   candidateCount: number;
+  strategy?: "focused" | "document_coverage";
+  indexedPageCount?: number;
+  selectedPageCount?: number;
 }
 
 export interface ChatMessage {
