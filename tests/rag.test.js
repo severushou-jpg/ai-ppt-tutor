@@ -58,8 +58,8 @@ test("QA retrieval finds relevant evidence and rejects unrelated questions", () 
     chunks,
     mode: "qa",
   });
-  assert.equal(relevant[0].label, "幻灯片 1");
-  assert.equal(relevant[1].label, "幻灯片 2");
+  assert(relevant.some((chunk) => chunk.label === "幻灯片 1"));
+  assert(relevant.some((chunk) => chunk.label === "幻灯片 2"));
   assert.equal(unrelated.length, 0);
   assert.equal(genericButUnrelated.length, 0);
 });
@@ -76,5 +76,39 @@ test("sources and grounding context use stable source numbers", () => {
   const sources = createSources(results);
   const context = buildGroundingContext(results);
   assert.equal(sources[0].id, 1);
-  assert.match(context, /\[来源1｜intro\.pptx｜幻灯片 2\]/);
+  assert.match(context, /\[来源1｜intro\.pptx｜幻灯片 2｜/);
+});
+
+test("structure-aware chunking preserves definitions, lists, tables and code", () => {
+  const ast = {
+    content: [{
+      type: "slide",
+      metadata: { slideNumber: 1 },
+      text: "核心概念\n进程是指正在执行的程序。\n\n• 创建进程\n• 调度进程\n\n| 字段 | 含义 |\n| PID | 标识符 |\n\nconst pid = fork();",
+    }],
+  };
+  const { chunks } = buildDocumentIndex(ast, { name: "os.pptx" });
+  const types = new Set(chunks.map((chunk) => chunk.contentType));
+  assert(types.has("definition"));
+  assert(types.has("list"));
+  assert(types.has("table"));
+  assert(types.has("code"));
+});
+
+test("semantic vectors can recall a chunk without keyword overlap", () => {
+  const chunks = [
+    { id: "a", fileName: "x.pdf", kind: "page", number: 1, label: "第 1 页", title: "并发", contentType: "prose", text: "线程同步", embedding: [1, 0] },
+    { id: "b", fileName: "x.pdf", kind: "page", number: 2, label: "第 2 页", title: "存储", contentType: "prose", text: "磁盘调度", embedding: [0, 1] },
+  ];
+  const result = retrieveChunks({ question: "parallel execution", chunks, mode: "qa", queryEmbedding: [1, 0] });
+  assert.equal(result[0].id, "a");
+  assert.equal(result[0].vectorScore, 1);
+});
+
+test("sources include a query-focused sentence highlight", () => {
+  const { chunks } = buildDocumentIndex(sampleAst, { name: "intro.pptx" });
+  const results = retrieveChunks({ question: "聚类算法", chunks, mode: "qa" });
+  const sources = createSources(results, "聚类算法");
+  assert.match(sources[0].highlight, /聚类/);
+  assert(sources[0].excerpt.includes(sources[0].highlight));
 });

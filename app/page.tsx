@@ -13,6 +13,7 @@ import {
   BookOpen,
   Brain,
   CheckCircle2,
+  ChevronDown,
   ChevronRight,
   CircleAlert,
   FileCheck2,
@@ -24,12 +25,17 @@ import {
   LoaderCircle,
   Menu,
   MessageCircleQuestion,
+  PanelRightClose,
+  PanelRightOpen,
+  RefreshCcw,
   RotateCcw,
   Search,
   Send,
   ShieldQuestion,
   Sparkles,
   Square,
+  ThumbsDown,
+  ThumbsUp,
   UploadCloud,
   X,
 } from "lucide-react";
@@ -39,8 +45,11 @@ import type {
   CitationSource,
   DocumentIndex,
   LearningMode,
+  RetrievalMetadata,
+  StructuredAnswer,
   UploadPhase,
 } from "./types";
+import { clearWorkspace, loadWorkspace, saveWorkspace } from "@/lib/client-storage";
 
 const MAX_FILE_BYTES = 20 * 1024 * 1024;
 
@@ -114,10 +123,13 @@ function citationMarkdown(content: string) {
 function MessageCard({
   message,
   onCitationClick,
+  onFeedback,
 }: {
   message: ChatMessage;
   onCitationClick: (sourceId: number, sources: CitationSource[]) => void;
+  onFeedback: (messageId: string, feedback: "helpful" | "inaccurate") => void;
 }) {
+  const [showAnswers, setShowAnswers] = useState(false);
   if (message.role === "user") {
     return (
       <div className="ml-auto max-w-2xl rounded-2xl rounded-br-md bg-slate-900 px-5 py-3.5 text-sm leading-6 text-white shadow-sm">
@@ -154,35 +166,64 @@ function MessageCard({
           </span>
         )}
       </header>
-      <div className="markdown-body px-5 py-5 text-sm leading-7 text-slate-700">
-        <ReactMarkdown
-          components={{
-            a: ({ href, children }) => {
-              const match = href?.match(/^#source-(\d+)$/);
-              if (match) {
-                const sourceId = Number(match[1]);
-                return (
-                  <button
-                    type="button"
-                    className="citation-chip"
-                    onClick={() => onCitationClick(sourceId, message.sources ?? [])}
-                    aria-label={`查看来源 ${sourceId}`}
-                  >
-                    {children}
-                  </button>
-                );
-              }
-              return (
-                <a href={href} target="_blank" rel="noreferrer">
-                  {children}
-                </a>
-              );
-            },
-          }}
-        >
-          {citationMarkdown(message.content)}
-        </ReactMarkdown>
-      </div>
+      {message.mode === "quiz" && message.structured?.quiz.length ? (
+        <div className="space-y-4 px-5 py-5 text-sm text-slate-700">
+          <div className="space-y-3">
+            {message.structured.quiz.map((item, index) => (
+              <div key={`${message.id}-quiz-${index}`} className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                <div className="flex items-start gap-3">
+                  <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-emerald-100 text-xs font-bold text-emerald-700">{index + 1}</span>
+                  <div className="min-w-0 flex-1">
+                    <span className="rounded-full bg-white px-2 py-0.5 text-[11px] font-semibold text-slate-500">{item.difficulty}</span>
+                    <p className="mt-2 leading-6 text-slate-800">{item.question}</p>
+                    {showAnswers && (
+                      <div className="mt-3 border-t border-slate-200 pt-3">
+                        <p><strong>答案：</strong>{item.answer}</p>
+                        <p className="mt-2 leading-6"><strong>解析：</strong>{item.explanation}</p>
+                        <div className="mt-2 flex flex-wrap gap-1.5">
+                          {item.citations.map((sourceId) => (
+                            <button key={sourceId} type="button" className="citation-chip" onClick={() => onCitationClick(sourceId, message.sources ?? [])}>来源{sourceId}</button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+          <button type="button" onClick={() => setShowAnswers((current) => !current)} className="inline-flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs font-semibold text-emerald-700 hover:bg-emerald-100">
+            <ChevronDown size={14} className={`transition ${showAnswers ? "rotate-180" : ""}`} />
+            {showAnswers ? "收起答案与解析" : "显示答案与解析"}
+          </button>
+          {message.structured.partialRefusal && (
+            <p className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs leading-5 text-slate-500">
+              {message.structured.partialRefusal}
+            </p>
+          )}
+        </div>
+      ) : (
+        <div className="markdown-body px-5 py-5 text-sm leading-7 text-slate-700">
+          <ReactMarkdown
+            components={{
+              a: ({ href, children }) => {
+                const match = href?.match(/^#source-(\d+)$/);
+                if (match) {
+                  const sourceId = Number(match[1]);
+                  return (
+                    <button type="button" className="citation-chip" onClick={() => onCitationClick(sourceId, message.sources ?? [])} aria-label={`查看来源 ${sourceId}`}>
+                      {children}
+                    </button>
+                  );
+                }
+                return <a href={href} target="_blank" rel="noreferrer">{children}</a>;
+              },
+            }}
+          >
+            {citationMarkdown(message.content)}
+          </ReactMarkdown>
+        </div>
+      )}
       {!!message.sources?.length && (
         <footer className="flex flex-wrap items-center gap-2 border-t border-slate-100 bg-slate-50/70 px-5 py-3">
           <span className="text-xs font-medium text-slate-500">引用</span>
@@ -198,7 +239,30 @@ function MessageCard({
           ))}
         </footer>
       )}
+      <div className="flex items-center justify-between border-t border-slate-100 px-5 py-2.5">
+        <span className="text-[11px] text-slate-400">
+          {message.retrieval?.mode === "hybrid" ? "关键词＋语义检索" : "关键词检索"}
+          {message.retrieval?.reranked ? " · 已重排序" : ""}
+        </span>
+        <div className="flex items-center gap-1" aria-label="回答反馈">
+          <button type="button" onClick={() => onFeedback(message.id, "helpful")} aria-label="回答有帮助" className={`rounded-lg p-1.5 transition ${message.feedback === "helpful" ? "bg-emerald-50 text-emerald-700" : "text-slate-400 hover:bg-slate-50 hover:text-slate-700"}`}><ThumbsUp size={14} /></button>
+          <button type="button" onClick={() => onFeedback(message.id, "inaccurate")} aria-label="回答不准确" className={`rounded-lg p-1.5 transition ${message.feedback === "inaccurate" ? "bg-red-50 text-red-700" : "text-slate-400 hover:bg-slate-50 hover:text-slate-700"}`}><ThumbsDown size={14} /></button>
+        </div>
+      </div>
     </article>
+  );
+}
+
+function HighlightedExcerpt({ source }: { source: CitationSource }) {
+  const highlight = source.highlight?.trim();
+  const index = highlight ? source.excerpt.indexOf(highlight) : -1;
+  if (!highlight || index < 0) return <>{source.excerpt}</>;
+  return (
+    <>
+      {source.excerpt.slice(0, index)}
+      <mark className="rounded bg-amber-200/80 px-0.5 text-slate-800">{highlight}</mark>
+      {source.excerpt.slice(index + highlight.length)}
+    </>
   );
 }
 
@@ -206,17 +270,22 @@ function SourcePanel({
   sources,
   selectedSourceId,
   onSelect,
+  onClose,
 }: {
   sources: CitationSource[];
   selectedSourceId: number | null;
   onSelect: (sourceId: number) => void;
+  onClose: () => void;
 }) {
   return (
     <div className="flex h-full flex-col">
       <div className="border-b border-slate-200 px-5 py-5">
-        <div className="flex items-center gap-2 text-slate-900">
-          <Highlighter size={18} className="text-blue-600" aria-hidden="true" />
-          <h2 className="font-semibold">课件依据</h2>
+        <div className="flex items-center justify-between gap-3 text-slate-900">
+          <div className="flex items-center gap-2">
+            <Highlighter size={18} className="text-blue-600" aria-hidden="true" />
+            <h2 className="font-semibold">课件依据</h2>
+          </div>
+          <button type="button" onClick={onClose} className="hidden rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700 lg:block" aria-label="收起来源栏"><PanelRightClose size={17} /></button>
         </div>
         <p className="mt-1 text-xs leading-5 text-slate-500">点击回答中的来源标记，可在这里查看对应原文片段。</p>
       </div>
@@ -251,7 +320,8 @@ function SourcePanel({
                     {source.label}
                   </span>
                 </div>
-                <p className="mt-3 line-clamp-6 text-xs leading-5 text-slate-600">{source.excerpt}</p>
+                {source.title && <p className="mt-3 truncate text-xs font-semibold text-slate-700">{source.title}</p>}
+                <p className="mt-2 line-clamp-8 text-xs leading-5 text-slate-600"><HighlightedExcerpt source={source} /></p>
                 <p className="mt-3 truncate text-[11px] text-slate-400">{source.fileName}</p>
               </button>
             );
@@ -267,6 +337,7 @@ export default function Home() {
   const [documentIndex, setDocumentIndex] = useState<DocumentIndex | null>(null);
   const [uploadPhase, setUploadPhase] = useState<UploadPhase>("idle");
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploadDetail, setUploadDetail] = useState<{ current: number; total: number | null; message: string } | null>(null);
   const [uploadError, setUploadError] = useState<ApiError | null>(null);
   const [requestError, setRequestError] = useState<string | null>(null);
   const [mode, setMode] = useState<LearningMode>("explain");
@@ -276,9 +347,12 @@ export default function Home() {
   const [activeSources, setActiveSources] = useState<CitationSource[]>([]);
   const [selectedSourceId, setSelectedSourceId] = useState<number | null>(null);
   const [mobileTab, setMobileTab] = useState<"files" | "learn" | "sources">("learn");
+  const [sourcePanelOpen, setSourcePanelOpen] = useState(true);
+  const [hydrated, setHydrated] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const uploadRequestRef = useRef<XMLHttpRequest | null>(null);
   const generationControllerRef = useRef<AbortController | null>(null);
+  const lastUploadFileRef = useRef<File | null>(null);
 
   const activeMode = MODES[mode];
   const uploadBusy = ["uploading", "parsing", "indexing"].includes(uploadPhase);
@@ -294,6 +368,42 @@ export default function Home() {
     };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    void loadWorkspace()
+      .then((snapshot) => {
+        if (cancelled || !snapshot || snapshot.version !== 1) return;
+        setDocumentIndex(snapshot.documentIndex);
+        setMessages(snapshot.messages);
+        setMode(snapshot.mode);
+        if (snapshot.documentIndex) setUploadPhase("ready");
+        const latestAssistant = [...snapshot.messages].reverse().find((message) => message.role === "assistant");
+        setActiveSources(latestAssistant?.sources ?? []);
+        setSelectedSourceId(latestAssistant?.sources?.[0]?.id ?? null);
+      })
+      .catch((error) => console.error("Workspace restore failed", error))
+      .finally(() => {
+        if (!cancelled) setHydrated(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    const timer = window.setTimeout(() => {
+      void saveWorkspace({
+        version: 1,
+        documentIndex,
+        messages,
+        mode,
+        savedAt: Date.now(),
+      }).catch((error) => console.error("Workspace persistence failed", error));
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [documentIndex, hydrated, messages, mode]);
+
   const recentHistory = useMemo(
     () =>
       messages.slice(-10).map(({ role, content }) => ({
@@ -308,9 +418,11 @@ export default function Home() {
     uploadRequestRef.current = null;
     setUploadPhase(documentIndex ? "ready" : "idle");
     setUploadProgress(0);
+    setUploadDetail(null);
   };
 
   const processDocument = (file: File) => {
+    lastUploadFileRef.current = file;
     const extension = file.name.toLowerCase().split(".").pop();
     if (!extension || !["pdf", "pptx"].includes(extension)) {
       setUploadError({ code: "UNSUPPORTED_FORMAT", message: "暂不支持该格式，请上传 PDF 或 PPTX。" });
@@ -326,20 +438,25 @@ export default function Home() {
     setUploadError(null);
     setRequestError(null);
     setUploadProgress(0);
+    setUploadDetail(null);
     setUploadPhase("uploading");
     const formData = new FormData();
     formData.append("file", file);
 
     const xhr = new XMLHttpRequest();
+    let responseOffset = 0;
+    let responseBuffer = "";
+    let receivedTerminalEvent = false;
     uploadRequestRef.current = xhr;
     xhr.open("POST", "/api/documents");
-    xhr.responseType = "json";
+    xhr.setRequestHeader("Accept", "application/x-ndjson");
     xhr.upload.onprogress = (event) => {
       if (event.lengthComputable) setUploadProgress(Math.round((event.loaded / event.total) * 100));
     };
     xhr.upload.onload = () => {
       setUploadProgress(100);
       setUploadPhase("parsing");
+      setUploadProgress(0);
     };
     xhr.onerror = () => {
       setUploadError({ code: "NETWORK_ERROR", message: "上传失败，请检查网络连接后重试。" });
@@ -349,26 +466,83 @@ export default function Home() {
     xhr.onabort = () => {
       uploadRequestRef.current = null;
     };
-    xhr.onload = () => {
-      uploadRequestRef.current = null;
-      const response = xhr.response as { document?: DocumentIndex; error?: ApiError } | null;
-      if (xhr.status < 200 || xhr.status >= 300 || !response?.document) {
-        setUploadError(
-          response?.error ?? { code: "UPLOAD_FAILED", message: "课件处理失败，请稍后重试。" },
-        );
-        setUploadPhase("error");
-        return;
-      }
 
-      setUploadPhase("indexing");
-      window.setTimeout(() => {
-        setDocumentIndex(response.document ?? null);
+    const applyStreamEvent = (event: {
+      type?: "progress" | "complete" | "error";
+      phase?: "parsing" | "indexing" | "embedding";
+      current?: number;
+      total?: number | null;
+      message?: string;
+      document?: DocumentIndex;
+      error?: ApiError;
+    }) => {
+      if (event.type === "progress" && event.phase) {
+        const phase = event.phase === "parsing" ? "parsing" : "indexing";
+        const current = Number(event.current ?? 0);
+        const total = event.total == null ? null : Number(event.total);
+        setUploadPhase(phase);
+        setUploadDetail({ current, total, message: event.message ?? UPLOAD_COPY[phase].detail });
+        setUploadProgress(total && total > 0 ? Math.round((current / total) * 100) : 0);
+      } else if (event.type === "complete" && event.document) {
+        receivedTerminalEvent = true;
+        lastUploadFileRef.current = null;
+        setDocumentIndex(event.document);
         setMessages([]);
         setActiveSources([]);
         setSelectedSourceId(null);
+        setUploadDetail(null);
+        setUploadProgress(100);
         setUploadPhase("ready");
         setMobileTab("learn");
-      }, 350);
+      } else if (event.type === "error") {
+        receivedTerminalEvent = true;
+        setUploadError(event.error ?? { code: "UPLOAD_FAILED", message: "课件处理失败，请稍后重试。" });
+        setUploadPhase("error");
+      }
+    };
+
+    const consumeResponse = (final = false) => {
+      const nextText = xhr.responseText.slice(responseOffset);
+      responseOffset = xhr.responseText.length;
+      responseBuffer += nextText;
+      const lines = responseBuffer.split("\n");
+      const remainder = lines.pop() ?? "";
+      responseBuffer = final ? "" : remainder;
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          applyStreamEvent(JSON.parse(line));
+        } catch {
+          if (final) setUploadError({ code: "INVALID_RESPONSE", message: "服务器返回了无法识别的处理结果。" });
+        }
+      }
+      if (final && remainder.trim()) {
+        try {
+          applyStreamEvent(JSON.parse(remainder));
+        } catch {
+          setUploadError({ code: "INVALID_RESPONSE", message: "服务器返回了无法识别的处理结果。" });
+        }
+      }
+    };
+
+    xhr.onprogress = () => consumeResponse(false);
+    xhr.onload = () => {
+      uploadRequestRef.current = null;
+      if (xhr.status < 200 || xhr.status >= 300) {
+        try {
+          const response = JSON.parse(xhr.responseText) as { error?: ApiError };
+          setUploadError(response.error ?? { code: "UPLOAD_FAILED", message: "课件处理失败，请稍后重试。" });
+        } catch {
+          setUploadError({ code: "UPLOAD_FAILED", message: "课件处理失败，请稍后重试。" });
+        }
+        setUploadPhase("error");
+        return;
+      }
+      consumeResponse(true);
+      if (!receivedTerminalEvent) {
+        setUploadError({ code: "INCOMPLETE_RESPONSE", message: "课件处理未完成，请重试。" });
+        setUploadPhase("error");
+      }
     };
     xhr.send(formData);
   };
@@ -414,6 +588,8 @@ export default function Home() {
         grounded?: boolean;
         refused?: boolean;
         sources?: CitationSource[];
+        structured?: StructuredAnswer;
+        retrieval?: RetrievalMetadata;
         error?: ApiError;
       };
       if (!response.ok || data.error || !data.content) {
@@ -428,6 +604,8 @@ export default function Home() {
         grounded: data.grounded,
         refused: data.refused,
         sources: data.sources ?? [],
+        structured: data.structured,
+        retrieval: data.retrieval,
       };
       setMessages((current) => [...current, assistantMessage]);
       setActiveSources(assistantMessage.sources ?? []);
@@ -461,6 +639,7 @@ export default function Home() {
     setActiveSources(sources);
     setSelectedSourceId(sourceId);
     setMobileTab("sources");
+    setSourcePanelOpen(true);
     window.setTimeout(() => {
       document.getElementById(`source-panel-${sourceId}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
     }, 50);
@@ -483,6 +662,15 @@ export default function Home() {
     setUploadError(null);
     setUploadPhase("idle");
     setMobileTab("files");
+    void clearWorkspace();
+  };
+
+  const handleFeedback = (messageId: string, feedback: "helpful" | "inaccurate") => {
+    setMessages((current) => current.map((message) =>
+      message.id === messageId
+        ? { ...message, feedback: message.feedback === feedback ? undefined : feedback }
+        : message,
+    ));
   };
 
   const handleInputKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -569,21 +757,34 @@ export default function Home() {
                 </span>
                 <div className="min-w-0">
                   <p className="text-sm font-semibold text-slate-800">{UPLOAD_COPY[uploadPhase].title}</p>
-                  <p className="mt-1 text-xs leading-5 text-slate-500">{uploadError?.message ?? UPLOAD_COPY[uploadPhase].detail}</p>
+                  <p className="mt-1 text-xs leading-5 text-slate-500">{uploadError?.message ?? uploadDetail?.message ?? UPLOAD_COPY[uploadPhase].detail}</p>
                 </div>
               </div>
               {uploadBusy && (
                 <div className="mt-4">
                   <div className="h-1.5 overflow-hidden rounded-full bg-slate-200">
                     <div
-                      className={`h-full rounded-full bg-blue-600 transition-all ${uploadPhase !== "uploading" ? "animate-pulse" : ""}`}
-                      style={{ width: uploadPhase === "uploading" ? `${uploadProgress}%` : "100%" }}
+                      className={`h-full rounded-full bg-blue-600 transition-all ${uploadPhase !== "uploading" && !uploadDetail?.total ? "animate-pulse" : ""}`}
+                      style={{ width: `${uploadPhase === "uploading" || uploadDetail?.total ? uploadProgress : 100}%` }}
                     />
                   </div>
                   <button type="button" onClick={(event) => { event.preventDefault(); cancelUpload(); }} className="mt-3 text-xs font-medium text-slate-500 hover:text-red-600">
                     取消处理
                   </button>
                 </div>
+              )}
+              {uploadPhase === "error" && (
+                <button
+                  type="button"
+                  onClick={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    if (lastUploadFileRef.current) processDocument(lastUploadFileRef.current);
+                  }}
+                  className="mt-3 inline-flex items-center gap-1.5 rounded-lg bg-white px-2.5 py-1.5 text-xs font-semibold text-red-700 shadow-sm hover:bg-red-100"
+                >
+                  <RefreshCcw size={13} /> 重试上次文件
+                </button>
               )}
             </label>
 
@@ -595,6 +796,9 @@ export default function Home() {
                     <p className="truncate text-sm font-semibold text-emerald-900" title={documentIndex.name}>{documentIndex.name}</p>
                     <p className="mt-1 text-xs text-emerald-700">
                       {documentIndex.sectionCount} 个来源 · {documentIndex.chunkCount} 个索引片段 · {formatBytes(documentIndex.size)}
+                    </p>
+                    <p className="mt-1 text-[11px] text-emerald-700/80">
+                      {documentIndex.retrievalMode === "hybrid" ? "语义＋关键词混合索引" : "关键词索引（语义服务已降级）"}
                     </p>
                     {documentIndex.truncated && <p className="mt-2 text-xs text-amber-700">课件较长，已在安全上限内建立索引。</p>}
                   </div>
@@ -652,9 +856,19 @@ export default function Home() {
               {documentIndex?.name ?? "上传课件后开始学习"}
             </h1>
           </div>
-          <span className={`hidden items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-semibold sm:inline-flex ${activeMode.accent}`}>
-            <activeMode.icon size={14} aria-hidden="true" /> {activeMode.label}
-          </span>
+          <div className="flex items-center gap-2">
+            <span className={`hidden items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-semibold sm:inline-flex ${activeMode.accent}`}>
+              <activeMode.icon size={14} aria-hidden="true" /> {activeMode.label}
+            </span>
+            <button
+              type="button"
+              onClick={() => setSourcePanelOpen((current) => !current)}
+              className="hidden rounded-lg border border-slate-200 p-2 text-slate-500 hover:border-blue-200 hover:bg-blue-50 hover:text-blue-700 lg:block"
+              aria-label={sourcePanelOpen ? "收起来源栏" : "展开来源栏"}
+            >
+              {sourcePanelOpen ? <PanelRightClose size={17} /> : <PanelRightOpen size={17} />}
+            </button>
+          </div>
         </header>
 
         <div className="flex-1 overflow-y-auto">
@@ -692,7 +906,7 @@ export default function Home() {
             ) : (
               <div className="space-y-5 pb-6">
                 {messages.map((message) => (
-                  <MessageCard key={message.id} message={message} onCitationClick={handleCitationClick} />
+                  <MessageCard key={message.id} message={message} onCitationClick={handleCitationClick} onFeedback={handleFeedback} />
                 ))}
                 {loading && (
                   <div className="max-w-3xl rounded-2xl border border-slate-200 bg-white p-5 shadow-sm" aria-live="polite">
@@ -749,8 +963,8 @@ export default function Home() {
         </div>
       </main>
 
-      <aside className={`${mobileTab === "sources" ? "block" : "hidden"} h-full w-full shrink-0 border-l border-slate-200 bg-white lg:block lg:w-80`}>
-        <SourcePanel sources={activeSources} selectedSourceId={selectedSourceId} onSelect={setSelectedSourceId} />
+      <aside className={`${mobileTab === "sources" ? "block" : "hidden"} h-full w-full shrink-0 border-l border-slate-200 bg-white ${sourcePanelOpen ? "lg:block lg:w-80" : "lg:hidden"}`}>
+        <SourcePanel sources={activeSources} selectedSourceId={selectedSourceId} onSelect={setSelectedSourceId} onClose={() => setSourcePanelOpen(false)} />
       </aside>
     </div>
   );
