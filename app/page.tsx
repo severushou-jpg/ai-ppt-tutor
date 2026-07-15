@@ -1,141 +1,757 @@
-'use client';
+"use client";
 
-import { useState, useRef, useEffect, ChangeEvent, KeyboardEvent } from 'react';
-import ReactMarkdown from 'react-markdown';
-import { Send, Upload, FileText, Brain, RotateCcw, Loader2 } from 'lucide-react';
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type DragEvent,
+  type KeyboardEvent,
+} from "react";
+import ReactMarkdown from "react-markdown";
+import {
+  BookOpen,
+  Brain,
+  CheckCircle2,
+  ChevronRight,
+  CircleAlert,
+  FileCheck2,
+  FileText,
+  FolderOpen,
+  GraduationCap,
+  Highlighter,
+  Layers3,
+  LoaderCircle,
+  Menu,
+  MessageCircleQuestion,
+  RotateCcw,
+  Search,
+  Send,
+  ShieldQuestion,
+  Sparkles,
+  Square,
+  UploadCloud,
+  X,
+} from "lucide-react";
+import type {
+  ApiError,
+  ChatMessage,
+  CitationSource,
+  DocumentIndex,
+  LearningMode,
+  UploadPhase,
+} from "./types";
 
-// 定义消息对象的结构
-interface Message {
-  role: 'user' | 'assistant';
-  content: string;
+const MAX_FILE_BYTES = 20 * 1024 * 1024;
+
+const MODES: Record<
+  LearningMode,
+  {
+    label: string;
+    shortLabel: string;
+    description: string;
+    icon: typeof BookOpen;
+    accent: string;
+    suggestions: string[];
+  }
+> = {
+  explain: {
+    label: "深入讲解",
+    shortLabel: "讲解",
+    description: "目标、例子、易错点与自检",
+    icon: GraduationCap,
+    accent: "bg-blue-50 text-blue-700 border-blue-200",
+    suggestions: ["请先概览这份课件的知识结构。", "从零开始讲解第一个核心概念。"],
+  },
+  qa: {
+    label: "课件问答",
+    shortLabel: "问答",
+    description: "只依据材料回答并标注来源",
+    icon: MessageCircleQuestion,
+    accent: "bg-violet-50 text-violet-700 border-violet-200",
+    suggestions: ["这份课件最重要的结论是什么？", "解释课件中的关键术语，并给出来源。"],
+  },
+  quiz: {
+    label: "生成练习",
+    shortLabel: "练习",
+    description: "带答案、解析和课件依据",
+    icon: FileCheck2,
+    accent: "bg-emerald-50 text-emerald-700 border-emerald-200",
+    suggestions: ["根据当前课件生成 5 道练习题。", "出一组从基础到应用的复习题。"],
+  },
+  review: {
+    label: "复习总结",
+    shortLabel: "复习",
+    description: "重点、混淆点与复习顺序",
+    icon: Layers3,
+    accent: "bg-amber-50 text-amber-800 border-amber-200",
+    suggestions: ["生成一份考前复习提纲。", "整理高频重点和容易混淆的内容。"],
+  },
+};
+
+const UPLOAD_COPY: Record<UploadPhase, { title: string; detail: string }> = {
+  idle: { title: "等待上传", detail: "支持 PDF / PPTX，最大 20MB" },
+  uploading: { title: "正在上传课件", detail: "请保持页面打开" },
+  parsing: { title: "正在解析文字与结构", detail: "按页或幻灯片保留来源" },
+  indexing: { title: "正在建立课件索引", detail: "马上就可以开始学习" },
+  ready: { title: "课件已准备好", detail: "现在可以讲解、问答或练习" },
+  error: { title: "课件处理失败", detail: "请根据提示重试" },
+};
+
+function createId() {
+  return globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
+}
+
+function formatBytes(bytes: number) {
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))}KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
+}
+
+function citationMarkdown(content: string) {
+  return content.replace(/\[来源\s*(\d+)\]/g, "[来源$1](#source-$1)");
+}
+
+function MessageCard({
+  message,
+  onCitationClick,
+}: {
+  message: ChatMessage;
+  onCitationClick: (sourceId: number, sources: CitationSource[]) => void;
+}) {
+  if (message.role === "user") {
+    return (
+      <div className="ml-auto max-w-2xl rounded-2xl rounded-br-md bg-slate-900 px-5 py-3.5 text-sm leading-6 text-white shadow-sm">
+        {message.content}
+      </div>
+    );
+  }
+
+  const mode = MODES[message.mode];
+  const Icon = message.refused ? ShieldQuestion : mode.icon;
+  const cardStyle = message.refused
+    ? "border-slate-200 bg-slate-50"
+    : "border-slate-200 bg-white";
+
+  return (
+    <article className={`max-w-3xl overflow-hidden rounded-2xl border shadow-sm ${cardStyle}`}>
+      <header className="flex items-center justify-between gap-3 border-b border-slate-100 px-5 py-3.5">
+        <div className="flex items-center gap-2.5">
+          <span className={`flex h-8 w-8 items-center justify-center rounded-lg border ${mode.accent}`}>
+            <Icon size={16} aria-hidden="true" />
+          </span>
+          <div>
+            <h2 className="text-sm font-semibold text-slate-900">
+              {message.refused ? "课件中未找到依据" : mode.label}
+            </h2>
+            <p className="text-xs text-slate-500">
+              {message.refused ? "系统没有使用课外内容猜测" : mode.description}
+            </p>
+          </div>
+        </div>
+        {message.grounded && (
+          <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2.5 py-1 text-[11px] font-medium text-emerald-700">
+            <CheckCircle2 size={12} aria-hidden="true" /> 已关联课件
+          </span>
+        )}
+      </header>
+      <div className="markdown-body px-5 py-5 text-sm leading-7 text-slate-700">
+        <ReactMarkdown
+          components={{
+            a: ({ href, children }) => {
+              const match = href?.match(/^#source-(\d+)$/);
+              if (match) {
+                const sourceId = Number(match[1]);
+                return (
+                  <button
+                    type="button"
+                    className="citation-chip"
+                    onClick={() => onCitationClick(sourceId, message.sources ?? [])}
+                    aria-label={`查看来源 ${sourceId}`}
+                  >
+                    {children}
+                  </button>
+                );
+              }
+              return (
+                <a href={href} target="_blank" rel="noreferrer">
+                  {children}
+                </a>
+              );
+            },
+          }}
+        >
+          {citationMarkdown(message.content)}
+        </ReactMarkdown>
+      </div>
+      {!!message.sources?.length && (
+        <footer className="flex flex-wrap items-center gap-2 border-t border-slate-100 bg-slate-50/70 px-5 py-3">
+          <span className="text-xs font-medium text-slate-500">引用</span>
+          {message.sources.map((source) => (
+            <button
+              key={`${message.id}-${source.id}`}
+              type="button"
+              onClick={() => onCitationClick(source.id, message.sources ?? [])}
+              className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-600 transition hover:border-blue-300 hover:text-blue-700"
+            >
+              {source.id} · {source.label}
+            </button>
+          ))}
+        </footer>
+      )}
+    </article>
+  );
+}
+
+function SourcePanel({
+  sources,
+  selectedSourceId,
+  onSelect,
+}: {
+  sources: CitationSource[];
+  selectedSourceId: number | null;
+  onSelect: (sourceId: number) => void;
+}) {
+  return (
+    <div className="flex h-full flex-col">
+      <div className="border-b border-slate-200 px-5 py-5">
+        <div className="flex items-center gap-2 text-slate-900">
+          <Highlighter size={18} className="text-blue-600" aria-hidden="true" />
+          <h2 className="font-semibold">课件依据</h2>
+        </div>
+        <p className="mt-1 text-xs leading-5 text-slate-500">点击回答中的来源标记，可在这里查看对应原文片段。</p>
+      </div>
+
+      <div className="flex-1 space-y-3 overflow-y-auto p-4">
+        {sources.length === 0 ? (
+          <div className="flex h-full flex-col items-center justify-center px-4 text-center text-slate-400">
+            <Search size={28} strokeWidth={1.5} aria-hidden="true" />
+            <p className="mt-3 text-sm font-medium text-slate-500">暂无引用</p>
+            <p className="mt-1 text-xs leading-5">完成一次讲解或问答后，相关课件片段会显示在这里。</p>
+          </div>
+        ) : (
+          sources.map((source) => {
+            const selected = source.id === selectedSourceId;
+            return (
+              <button
+                key={`${source.chunkId}-${source.id}`}
+                id={`source-panel-${source.id}`}
+                type="button"
+                onClick={() => onSelect(source.id)}
+                className={`w-full rounded-xl border p-4 text-left transition ${
+                  selected
+                    ? "border-blue-300 bg-blue-50 shadow-sm"
+                    : "border-slate-200 bg-white hover:border-slate-300"
+                }`}
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-blue-700">
+                    <FileText size={13} aria-hidden="true" /> 来源 {source.id}
+                  </span>
+                  <span className="rounded-full bg-white/80 px-2 py-0.5 text-[11px] font-medium text-slate-500">
+                    {source.label}
+                  </span>
+                </div>
+                <p className="mt-3 line-clamp-6 text-xs leading-5 text-slate-600">{source.excerpt}</p>
+                <p className="mt-3 truncate text-[11px] text-slate-400">{source.fileName}</p>
+              </button>
+            );
+          })
+        )}
+      </div>
+    </div>
+  );
 }
 
 export default function Home() {
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [file, setFile] = useState<File | null>(null);
-  const [input, setInput] = useState<string>('');
-  const [loading, setLoading] = useState<boolean>(false);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [documentIndex, setDocumentIndex] = useState<DocumentIndex | null>(null);
+  const [uploadPhase, setUploadPhase] = useState<UploadPhase>("idle");
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploadError, setUploadError] = useState<ApiError | null>(null);
+  const [requestError, setRequestError] = useState<string | null>(null);
+  const [mode, setMode] = useState<LearningMode>("explain");
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const [activeSources, setActiveSources] = useState<CitationSource[]>([]);
+  const [selectedSourceId, setSelectedSourceId] = useState<number | null>(null);
+  const [mobileTab, setMobileTab] = useState<"files" | "learn" | "sources">("learn");
   const scrollRef = useRef<HTMLDivElement>(null);
+  const uploadRequestRef = useRef<XMLHttpRequest | null>(null);
+  const generationControllerRef = useRef<AbortController | null>(null);
 
-  // 自动滚动
+  const activeMode = MODES[mode];
+  const uploadBusy = ["uploading", "parsing", "indexing"].includes(uploadPhase);
+
   useEffect(() => {
-    scrollRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+    scrollRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [messages, loading]);
 
-  // 处理文件上传选择
-  const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) {
-      setFile(e.target.files[0]);
+  useEffect(() => {
+    return () => {
+      uploadRequestRef.current?.abort();
+      generationControllerRef.current?.abort();
+    };
+  }, []);
+
+  const recentHistory = useMemo(
+    () =>
+      messages.slice(-10).map(({ role, content }) => ({
+        role,
+        content,
+      })),
+    [messages],
+  );
+
+  const cancelUpload = () => {
+    uploadRequestRef.current?.abort();
+    uploadRequestRef.current = null;
+    setUploadPhase(documentIndex ? "ready" : "idle");
+    setUploadProgress(0);
+  };
+
+  const processDocument = (file: File) => {
+    const extension = file.name.toLowerCase().split(".").pop();
+    if (!extension || !["pdf", "pptx"].includes(extension)) {
+      setUploadError({ code: "UNSUPPORTED_FORMAT", message: "暂不支持该格式，请上传 PDF 或 PPTX。" });
+      setUploadPhase("error");
+      return;
     }
+    if (file.size > MAX_FILE_BYTES) {
+      setUploadError({ code: "FILE_TOO_LARGE", message: "文件超过 20MB 限制，请压缩后重试。" });
+      setUploadPhase("error");
+      return;
+    }
+
+    setUploadError(null);
+    setRequestError(null);
+    setUploadProgress(0);
+    setUploadPhase("uploading");
+    const formData = new FormData();
+    formData.append("file", file);
+
+    const xhr = new XMLHttpRequest();
+    uploadRequestRef.current = xhr;
+    xhr.open("POST", "/api/documents");
+    xhr.responseType = "json";
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) setUploadProgress(Math.round((event.loaded / event.total) * 100));
+    };
+    xhr.upload.onload = () => {
+      setUploadProgress(100);
+      setUploadPhase("parsing");
+    };
+    xhr.onerror = () => {
+      setUploadError({ code: "NETWORK_ERROR", message: "上传失败，请检查网络连接后重试。" });
+      setUploadPhase("error");
+      uploadRequestRef.current = null;
+    };
+    xhr.onabort = () => {
+      uploadRequestRef.current = null;
+    };
+    xhr.onload = () => {
+      uploadRequestRef.current = null;
+      const response = xhr.response as { document?: DocumentIndex; error?: ApiError } | null;
+      if (xhr.status < 200 || xhr.status >= 300 || !response?.document) {
+        setUploadError(
+          response?.error ?? { code: "UPLOAD_FAILED", message: "课件处理失败，请稍后重试。" },
+        );
+        setUploadPhase("error");
+        return;
+      }
+
+      setUploadPhase("indexing");
+      window.setTimeout(() => {
+        setDocumentIndex(response.document ?? null);
+        setMessages([]);
+        setActiveSources([]);
+        setSelectedSourceId(null);
+        setUploadPhase("ready");
+        setMobileTab("learn");
+      }, 350);
+    };
+    xhr.send(formData);
+  };
+
+  const handleDrop = (event: DragEvent<HTMLLabelElement>) => {
+    event.preventDefault();
+    setDragging(false);
+    const file = event.dataTransfer.files?.[0];
+    if (file) processDocument(file);
   };
 
   const askAI = async (customText?: string) => {
-    const targetText = customText || input;
-    if (!targetText && !file) return;
+    const question = (customText ?? input).trim();
+    if (!question || !documentIndex || loading) return;
 
+    const userMessage: ChatMessage = {
+      id: createId(),
+      role: "user",
+      content: question,
+      mode,
+    };
+    setMessages((current) => [...current, userMessage]);
+    setInput("");
+    setRequestError(null);
     setLoading(true);
-    const userMsg: Message = { role: 'user', content: targetText || "请根据课件开始教学" };
-    const newMessages = [...messages, userMsg];
-    setMessages(newMessages);
-    setInput('');
+    const controller = new AbortController();
+    generationControllerRef.current = controller;
 
     try {
-      const formData = new FormData();
-      if (file) formData.append('file', file);
-      formData.append('question', userMsg.content);
-      // 传递最近的上下文
-      formData.append('history', JSON.stringify(messages.slice(-10)));
+      const response = await fetch("/api/ai", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          question,
+          mode,
+          document: documentIndex,
+          history: recentHistory,
+        }),
+        signal: controller.signal,
+      });
+      const data = (await response.json()) as {
+        content?: string;
+        grounded?: boolean;
+        refused?: boolean;
+        sources?: CitationSource[];
+        error?: ApiError;
+      };
+      if (!response.ok || data.error || !data.content) {
+        throw new Error(data.error?.message ?? "生成失败，请稍后重试。");
+      }
 
-      const res = await fetch('/api/ai', { method: 'POST', body: formData });
-      const data = await res.json();
-
-      if (data.error) throw new Error(data.error);
-
-      setMessages(prev => [...prev, { role: 'assistant', content: data.content }]);
-      if (file) setFile(null); 
-    } catch (err: any) {
-      setMessages(prev => [...prev, { role: 'assistant', content: "⚠️ 出错了：" + err.message }]);
+      const assistantMessage: ChatMessage = {
+        id: createId(),
+        role: "assistant",
+        content: data.content,
+        mode,
+        grounded: data.grounded,
+        refused: data.refused,
+        sources: data.sources ?? [],
+      };
+      setMessages((current) => [...current, assistantMessage]);
+      setActiveSources(assistantMessage.sources ?? []);
+      setSelectedSourceId(assistantMessage.sources?.[0]?.id ?? null);
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        setMessages((current) => [
+          ...current,
+          {
+            id: createId(),
+            role: "assistant",
+            content: "生成已停止。你可以修改问题或切换学习模式后重试。",
+            mode,
+            grounded: false,
+          },
+        ]);
+      } else {
+        setRequestError(error instanceof Error ? error.message : "生成失败，请稍后重试。");
+      }
     } finally {
+      if (generationControllerRef.current === controller) generationControllerRef.current = null;
       setLoading(false);
     }
   };
 
-  const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Enter' && !loading) {
-      askAI();
+  const stopGeneration = () => {
+    generationControllerRef.current?.abort();
+  };
+
+  const handleCitationClick = (sourceId: number, sources: CitationSource[]) => {
+    setActiveSources(sources);
+    setSelectedSourceId(sourceId);
+    setMobileTab("sources");
+    window.setTimeout(() => {
+      document.getElementById(`source-panel-${sourceId}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }, 50);
+  };
+
+  const clearConversation = () => {
+    if (messages.length > 0 && !window.confirm("确定清空当前学习记录吗？此操作无法撤销。")) return;
+    setMessages([]);
+    setActiveSources([]);
+    setSelectedSourceId(null);
+    setRequestError(null);
+  };
+
+  const removeDocument = () => {
+    if (messages.length > 0 && !window.confirm("移除课件会同时清空当前学习记录，确定继续吗？")) return;
+    setDocumentIndex(null);
+    setMessages([]);
+    setActiveSources([]);
+    setSelectedSourceId(null);
+    setUploadError(null);
+    setUploadPhase("idle");
+    setMobileTab("files");
+  };
+
+  const handleInputKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+      event.preventDefault();
+      void askAI();
     }
   };
 
   return (
-    <div className="flex h-screen bg-gray-50 text-slate-900">
-      <aside className="w-80 bg-white border-r flex flex-col p-6 shadow-sm">
-        <div className="flex items-center gap-3 mb-10 text-blue-600">
-          <Brain size={32} />
-          <h1 className="text-xl font-bold tracking-tight">Severus' AI 课件私教</h1>
+    <div className="flex h-dvh flex-col overflow-hidden bg-slate-100 text-slate-900 lg:flex-row">
+      <nav className="grid grid-cols-3 border-b border-slate-200 bg-white p-2 lg:hidden" aria-label="移动端工作区导航">
+        {([
+          ["files", FolderOpen, "文件"],
+          ["learn", BookOpen, "学习"],
+          ["sources", Highlighter, "引用"],
+        ] as const).map(([tab, Icon, label]) => (
+          <button
+            key={tab}
+            type="button"
+            onClick={() => setMobileTab(tab)}
+            className={`flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-sm font-medium ${
+              mobileTab === tab ? "bg-blue-50 text-blue-700" : "text-slate-500"
+            }`}
+          >
+            <Icon size={16} aria-hidden="true" /> {label}
+          </button>
+        ))}
+      </nav>
+
+      <aside
+        className={`${mobileTab === "files" ? "flex" : "hidden"} h-full w-full flex-col border-r border-slate-200 bg-white lg:flex lg:w-64 lg:shrink-0`}
+      >
+        <div className="flex items-center gap-3 border-b border-slate-100 px-5 py-5">
+          <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-blue-600 text-white shadow-sm shadow-blue-200">
+            <Brain size={22} aria-hidden="true" />
+          </span>
+          <div>
+            <p className="font-semibold tracking-tight text-slate-950">AI PPT Tutor</p>
+            <p className="text-xs text-slate-500">基于课件的学习工作区</p>
+          </div>
         </div>
 
-        <div className="flex-1 space-y-6">
+        <div className="flex-1 space-y-6 overflow-y-auto p-4">
           <section>
-            <h3 className="text-xs font-semibold text-gray-400 uppercase mb-3">上传教学课件</h3>
-            <label className="flex flex-col items-center justify-center w-full h-32 border-2 border-dashed border-gray-200 rounded-2xl cursor-pointer hover:bg-blue-50 transition-all">
-              <Upload className="text-gray-400 mb-2" />
-              <p className="text-xs text-center px-4 text-gray-500 overflow-hidden text-ellipsis">
-                {file ? file.name : "点击上传 (PDF/PPT)"}
-              </p>
-              <input type="file" className="hidden" onChange={handleFileChange} accept=".pdf,.pptx" />
+            <div className="mb-2 flex items-center justify-between">
+              <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-400">课件文件</h2>
+              {documentIndex && (
+                <button type="button" onClick={removeDocument} className="text-xs text-slate-400 hover:text-red-600">
+                  移除
+                </button>
+              )}
+            </div>
+
+            <label
+              className={`block cursor-pointer rounded-2xl border-2 border-dashed p-4 transition ${
+                dragging
+                  ? "border-blue-400 bg-blue-50"
+                  : uploadError
+                    ? "border-red-200 bg-red-50"
+                    : "border-slate-200 bg-slate-50 hover:border-blue-300 hover:bg-blue-50/50"
+              }`}
+              onDragOver={(event) => {
+                event.preventDefault();
+                setDragging(true);
+              }}
+              onDragLeave={() => setDragging(false)}
+              onDrop={handleDrop}
+            >
+              <input
+                type="file"
+                className="sr-only"
+                accept=".pdf,.pptx,application/pdf,application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                disabled={uploadBusy}
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  if (file) processDocument(file);
+                  event.target.value = "";
+                }}
+              />
+              <div className="flex items-start gap-3">
+                <span className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl ${uploadError ? "bg-red-100 text-red-600" : "bg-white text-blue-600 shadow-sm"}`}>
+                  {uploadBusy ? <LoaderCircle size={18} className="animate-spin" /> : <UploadCloud size={18} />}
+                </span>
+                <div className="min-w-0">
+                  <p className="text-sm font-semibold text-slate-800">{UPLOAD_COPY[uploadPhase].title}</p>
+                  <p className="mt-1 text-xs leading-5 text-slate-500">{uploadError?.message ?? UPLOAD_COPY[uploadPhase].detail}</p>
+                </div>
+              </div>
+              {uploadBusy && (
+                <div className="mt-4">
+                  <div className="h-1.5 overflow-hidden rounded-full bg-slate-200">
+                    <div
+                      className={`h-full rounded-full bg-blue-600 transition-all ${uploadPhase !== "uploading" ? "animate-pulse" : ""}`}
+                      style={{ width: uploadPhase === "uploading" ? `${uploadProgress}%` : "100%" }}
+                    />
+                  </div>
+                  <button type="button" onClick={(event) => { event.preventDefault(); cancelUpload(); }} className="mt-3 text-xs font-medium text-slate-500 hover:text-red-600">
+                    取消处理
+                  </button>
+                </div>
+              )}
             </label>
-            {file && (
-              <button onClick={() => askAI()} className="w-full mt-3 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700">
-                开始学习
-              </button>
+
+            {documentIndex && uploadPhase === "ready" && (
+              <div className="mt-3 rounded-xl border border-emerald-200 bg-emerald-50 p-3">
+                <div className="flex items-start gap-2.5">
+                  <FileCheck2 size={17} className="mt-0.5 shrink-0 text-emerald-700" />
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-semibold text-emerald-900" title={documentIndex.name}>{documentIndex.name}</p>
+                    <p className="mt-1 text-xs text-emerald-700">
+                      {documentIndex.sectionCount} 个来源 · {documentIndex.chunkCount} 个索引片段 · {formatBytes(documentIndex.size)}
+                    </p>
+                    {documentIndex.truncated && <p className="mt-2 text-xs text-amber-700">课件较长，已在安全上限内建立索引。</p>}
+                  </div>
+                </div>
+              </div>
             )}
           </section>
 
-          <section className="pt-6 border-t">
-            <button onClick={() => askAI("请根据当前课件内容，为我出一份练习题。")} className="w-full mb-2 flex items-center gap-2 px-3 py-2 text-sm text-gray-600 hover:bg-gray-100 rounded-lg">
-              <FileText size={16} /> 测验模式
-            </button>
-            <button onClick={() => setMessages([])} className="w-full flex items-center gap-2 px-3 py-2 text-sm text-red-500 hover:bg-red-50 rounded-lg">
-              <RotateCcw size={16} /> 清空记录
-            </button>
+          <section>
+            <h2 className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-400">学习模式</h2>
+            <div className="space-y-1.5">
+              {(Object.entries(MODES) as [LearningMode, (typeof MODES)[LearningMode]][]).map(([key, item]) => {
+                const Icon = item.icon;
+                return (
+                  <button
+                    key={key}
+                    type="button"
+                    onClick={() => { setMode(key); setMobileTab("learn"); }}
+                    className={`flex w-full items-center gap-3 rounded-xl border px-3 py-2.5 text-left transition ${
+                      mode === key ? item.accent : "border-transparent text-slate-600 hover:bg-slate-50"
+                    }`}
+                  >
+                    <Icon size={17} aria-hidden="true" />
+                    <span className="min-w-0 flex-1">
+                      <span className="block text-sm font-semibold">{item.label}</span>
+                      <span className="block truncate text-[11px] opacity-75">{item.description}</span>
+                    </span>
+                    <ChevronRight size={14} aria-hidden="true" />
+                  </button>
+                );
+              })}
+            </div>
           </section>
+        </div>
+
+        <div className="border-t border-slate-100 p-4">
+          <button
+            type="button"
+            onClick={clearConversation}
+            disabled={messages.length === 0}
+            className="flex w-full items-center justify-center gap-2 rounded-xl px-3 py-2 text-sm font-medium text-slate-500 transition hover:bg-red-50 hover:text-red-600 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            <RotateCcw size={15} aria-hidden="true" /> 清空学习记录
+          </button>
         </div>
       </aside>
 
-      <main className="flex-1 flex flex-col">
-        <div className="flex-1 overflow-y-auto p-8 space-y-6">
-          {messages.length === 0 && (
-            <div className="h-full flex flex-col items-center justify-center text-gray-300">
-              <p>请上传 PDF 并向 AI 教授提问</p>
+      <main className={`${mobileTab === "learn" ? "flex" : "hidden"} min-w-0 flex-1 flex-col bg-[#f7f9fc] lg:flex`}>
+        <header className="flex items-center justify-between gap-4 border-b border-slate-200 bg-white px-5 py-4 lg:px-7">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 text-xs font-medium text-slate-400">
+              <BookOpen size={13} aria-hidden="true" /> 学习工作区
             </div>
-          )}
-          {messages.map((m, i) => (
-            <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-              <div className={`max-w-[85%] px-6 py-4 rounded-2xl shadow-sm ${
-                m.role === 'user' ? 'bg-blue-600 text-white' : 'bg-white border prose prose-slate max-w-none'
-              }`}>
-                <ReactMarkdown>{m.content}</ReactMarkdown>
+            <h1 className="mt-1 truncate text-base font-semibold text-slate-950">
+              {documentIndex?.name ?? "上传课件后开始学习"}
+            </h1>
+          </div>
+          <span className={`hidden items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-semibold sm:inline-flex ${activeMode.accent}`}>
+            <activeMode.icon size={14} aria-hidden="true" /> {activeMode.label}
+          </span>
+        </header>
+
+        <div className="flex-1 overflow-y-auto">
+          <div className="mx-auto flex min-h-full max-w-4xl flex-col px-4 py-6 sm:px-6 lg:py-8">
+            {!documentIndex ? (
+              <div className="flex flex-1 flex-col items-center justify-center text-center">
+                <span className="flex h-16 w-16 items-center justify-center rounded-2xl border border-blue-100 bg-blue-50 text-blue-600">
+                  <UploadCloud size={28} strokeWidth={1.8} aria-hidden="true" />
+                </span>
+                <h2 className="mt-5 text-xl font-semibold tracking-tight text-slate-900">先添加一份课件</h2>
+                <p className="mt-2 max-w-md text-sm leading-6 text-slate-500">
+                  系统会按页或幻灯片建立索引。之后的讲解、回答和练习都会显示课件来源。
+                </p>
+                <button type="button" onClick={() => setMobileTab("files")} className="mt-6 inline-flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-blue-700 lg:hidden">
+                  <Menu size={16} /> 打开文件面板
+                </button>
               </div>
-            </div>
-          ))}
-          <div ref={scrollRef} />
+            ) : messages.length === 0 ? (
+              <div className="flex flex-1 flex-col items-center justify-center py-10 text-center">
+                <span className={`flex h-14 w-14 items-center justify-center rounded-2xl border ${activeMode.accent}`}>
+                  <activeMode.icon size={25} aria-hidden="true" />
+                </span>
+                <p className="mt-5 text-xs font-semibold uppercase tracking-[0.18em] text-blue-600">{activeMode.shortLabel}模式</p>
+                <h2 className="mt-2 text-2xl font-semibold tracking-tight text-slate-950">{activeMode.label}</h2>
+                <p className="mt-2 max-w-lg text-sm leading-6 text-slate-500">{activeMode.description}。回答会优先显示可核查的课件来源。</p>
+                <div className="mt-7 grid w-full max-w-2xl gap-3 sm:grid-cols-2">
+                  {activeMode.suggestions.map((suggestion) => (
+                    <button key={suggestion} type="button" onClick={() => void askAI(suggestion)} className="group flex items-center justify-between rounded-2xl border border-slate-200 bg-white p-4 text-left text-sm font-medium leading-6 text-slate-700 shadow-sm transition hover:border-blue-300 hover:shadow-md">
+                      <span>{suggestion}</span>
+                      <Sparkles size={16} className="shrink-0 text-blue-500 transition group-hover:rotate-6" />
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-5 pb-6">
+                {messages.map((message) => (
+                  <MessageCard key={message.id} message={message} onCitationClick={handleCitationClick} />
+                ))}
+                {loading && (
+                  <div className="max-w-3xl rounded-2xl border border-slate-200 bg-white p-5 shadow-sm" aria-live="polite">
+                    <div className="flex items-center gap-3">
+                      <LoaderCircle size={18} className="animate-spin text-blue-600" />
+                      <div>
+                        <p className="text-sm font-semibold text-slate-800">正在检索课件并生成{activeMode.shortLabel}</p>
+                        <p className="mt-1 text-xs text-slate-500">只会使用与当前问题相关的课件片段。</p>
+                      </div>
+                    </div>
+                  </div>
+                )}
+                <div ref={scrollRef} />
+              </div>
+            )}
+          </div>
         </div>
 
-        <div className="p-6 bg-white border-t">
-          <div className="max-w-3xl mx-auto flex gap-4">
-            <input
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder="提问..."
-              className="flex-1 bg-gray-100 px-6 py-3 rounded-full focus:outline-none"
-            />
-            <button onClick={() => askAI()} className="w-12 h-12 flex items-center justify-center bg-blue-600 text-white rounded-full">
-              {loading ? <Loader2 className="animate-spin" /> : <Send size={20} />}
-            </button>
+        <div className="border-t border-slate-200 bg-white px-4 py-4 sm:px-6">
+          <div className="mx-auto max-w-4xl">
+            {requestError && (
+              <div className="mb-3 flex items-start justify-between gap-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700" role="alert">
+                <span className="flex items-start gap-2"><CircleAlert size={16} className="mt-0.5 shrink-0" />{requestError}</span>
+                <button type="button" onClick={() => setRequestError(null)} aria-label="关闭错误提示"><X size={15} /></button>
+              </div>
+            )}
+            <div className="rounded-2xl border border-slate-200 bg-white p-2 shadow-[0_8px_30px_rgba(15,23,42,0.08)] focus-within:border-blue-300 focus-within:ring-4 focus-within:ring-blue-50">
+              <textarea
+                value={input}
+                onChange={(event) => setInput(event.target.value)}
+                onKeyDown={handleInputKeyDown}
+                disabled={!documentIndex || loading}
+                rows={2}
+                maxLength={2000}
+                placeholder={documentIndex ? `在${activeMode.shortLabel}模式下输入问题…` : "请先上传课件"}
+                className="max-h-36 min-h-14 w-full resize-none bg-transparent px-3 py-2 text-sm leading-6 text-slate-800 outline-none placeholder:text-slate-400 disabled:cursor-not-allowed"
+                aria-label="学习问题"
+              />
+              <div className="flex items-center justify-between gap-3 px-2 pb-1">
+                <p className="text-[11px] text-slate-400">Enter 发送 · Shift+Enter 换行</p>
+                {loading ? (
+                  <button type="button" onClick={stopGeneration} className="inline-flex h-9 items-center gap-2 rounded-xl bg-slate-900 px-3 text-sm font-semibold text-white hover:bg-slate-700">
+                    <Square size={13} fill="currentColor" /> 停止
+                  </button>
+                ) : (
+                  <button type="button" onClick={() => void askAI()} disabled={!documentIndex || !input.trim()} className="inline-flex h-9 items-center gap-2 rounded-xl bg-blue-600 px-3 text-sm font-semibold text-white shadow-sm hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400">
+                    <Send size={15} /> 发送
+                  </button>
+                )}
+              </div>
+            </div>
+            <p className="mt-2 text-center text-[11px] text-slate-400">AI 可能出错，请通过引用核对课件原文。</p>
           </div>
         </div>
       </main>
+
+      <aside className={`${mobileTab === "sources" ? "block" : "hidden"} h-full w-full shrink-0 border-l border-slate-200 bg-white lg:block lg:w-80`}>
+        <SourcePanel sources={activeSources} selectedSourceId={selectedSourceId} onSelect={setSelectedSourceId} />
+      </aside>
     </div>
   );
 }

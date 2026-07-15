@@ -1,36 +1,47 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# AI PPT Tutor
 
-## Getting Started
+一个基于 PDF / PPTX 课件的 AI 学习工作区。上传课件后，系统会按页或幻灯片提取文本、建立分块索引，并在讲解、问答、练习和复习模式中返回可核查的课件来源。
 
-First, run the development server:
+## 本地运行
+
+环境要求：Node.js 20 或更高版本。
 
 ```bash
+npm install
+cp .env.example .env.local
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+然后打开 [http://localhost:3000](http://localhost:3000)。在 `.env.local` 中填写 DashScope API Key 后，才能使用 AI 生成能力：
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```dotenv
+DASHSCOPE_API_KEY=your_dashscope_api_key
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+不要提交包含真实密钥的 `.env.local`。
 
-## Learn More
+## 当前能力
 
-To learn more about Next.js, take a look at the following resources:
+- 支持 PDF、PPTX，单文件最大 20MB
+- 文件格式、MIME、文件头、解析超时和内容上限校验
+- 按页或幻灯片分块，保留来源位置
+- 中英文关键词检索与课件内 RAG
+- 回答引用、来源原文面板和证据不足拒答
+- 深入讲解、课件问答、生成练习、复习总结四种学习模式
+- 桌面三栏工作区和移动端文件／学习／引用标签页
+- 上传进度、解析状态、取消上传、停止生成和结构化错误提示
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## 检查命令
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+```bash
+npm test
+npm run lint
+npm run build
+```
 
-## Deploy on Vercel
+## 已知限制
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- 当前检索是本地词法检索，不是向量数据库或语义嵌入检索。
+- 暂不支持扫描件 OCR；没有文本层的文件会提示用户更换文件。
+- 文档索引保存在当前浏览器页面状态中，刷新页面后需要重新上传。
+- 当前版本未包含用户账号、数据库和学习效果测评。
