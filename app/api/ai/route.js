@@ -88,6 +88,8 @@ function parseDocument(value) {
       contentType: VALID_CONTENT_TYPES.has(chunk.contentType) ? chunk.contentType : "prose",
       text: normalizeWhitespace(chunk.text).slice(0, 1_500),
       embedding: safeEmbedding(chunk.embedding),
+      textOrigin: ["native", "ocr", "mixed"].includes(chunk.textOrigin) ? chunk.textOrigin : "native",
+      ocrConfidence: Number.isFinite(Number(chunk.ocrConfidence)) ? Number(chunk.ocrConfidence) : undefined,
     }))
     .filter((chunk) => chunk.text.length >= 12);
   if (chunks.length === 0) return null;

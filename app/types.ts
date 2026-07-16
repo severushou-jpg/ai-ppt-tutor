@@ -1,7 +1,11 @@
 export type LearningMode = "explain" | "qa" | "quiz" | "review";
+export type OcrMode = "none" | "force";
 
 export type UploadPhase =
   | "idle"
+  | "preparing_ocr"
+  | "rendering"
+  | "ocr"
   | "uploading"
   | "parsing"
   | "indexing"
@@ -19,6 +23,18 @@ export interface DocumentChunk {
   structureTypes?: Array<"prose" | "definition" | "list" | "table" | "code">;
   text: string;
   embedding?: number[];
+  textOrigin?: "native" | "ocr" | "mixed";
+  ocrConfidence?: number;
+}
+
+export interface OcrSummary {
+  mode: OcrMode;
+  engine?: "tesseract.js";
+  totalPageCount: number;
+  successfulPageCount: number;
+  failedPageCount: number;
+  averageConfidence?: number;
+  durationMs?: number;
 }
 
 export interface DocumentIndex {
@@ -34,6 +50,7 @@ export interface DocumentIndex {
   retrievalMode?: "lexical" | "hybrid";
   embeddingModel?: string;
   embeddingDimensions?: number;
+  ocr?: OcrSummary;
   chunks: DocumentChunk[];
 }
 

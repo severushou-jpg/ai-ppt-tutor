@@ -45,14 +45,16 @@ import type {
   CitationSource,
   DocumentIndex,
   LearningMode,
+  OcrMode,
   RetrievalMetadata,
   StructuredAnswer,
   UploadPhase,
 } from "./types";
 import { clearWorkspace, loadWorkspace, saveWorkspace } from "@/lib/client-storage";
+import { runBrowserOcr } from "@/lib/client-ocr/controller";
 
 const MAX_FILE_BYTES = 20 * 1024 * 1024;
-const CURRENT_DOCUMENT_INDEX_VERSION = 2;
+const CURRENT_DOCUMENT_INDEX_VERSION = 3;
 
 const MODES: Record<
   LearningMode,
@@ -101,6 +103,9 @@ const MODES: Record<
 
 const UPLOAD_COPY: Record<UploadPhase, { title: string; detail: string }> = {
   idle: { title: "等待上传", detail: "支持 PDF / PPTX，最大 20MB" },
+  preparing_ocr: { title: "正在准备 OCR", detail: "首次使用需要加载中英文识别模型" },
+  rendering: { title: "正在渲染课件页面", detail: "所有 OCR 处理都在当前浏览器完成" },
+  ocr: { title: "正在进行全页 OCR", detail: "请保持页面打开" },
   uploading: { title: "正在上传课件", detail: "请保持页面打开" },
   parsing: { title: "正在解析文字与结构", detail: "按页或幻灯片保留来源" },
   indexing: { title: "正在建立课件索引", detail: "马上就可以开始学习" },
@@ -345,6 +350,7 @@ export default function Home() {
   const [uploadError, setUploadError] = useState<ApiError | null>(null);
   const [requestError, setRequestError] = useState<string | null>(null);
   const [mode, setMode] = useState<LearningMode>("explain");
+  const [ocrMode, setOcrMode] = useState<OcrMode>("none");
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [dragging, setDragging] = useState(false);
@@ -356,10 +362,11 @@ export default function Home() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const uploadRequestRef = useRef<XMLHttpRequest | null>(null);
   const generationControllerRef = useRef<AbortController | null>(null);
+  const ocrControllerRef = useRef<AbortController | null>(null);
   const lastUploadFileRef = useRef<File | null>(null);
 
   const activeMode = MODES[mode];
-  const uploadBusy = ["uploading", "parsing", "indexing"].includes(uploadPhase);
+  const uploadBusy = ["preparing_ocr", "rendering", "ocr", "uploading", "parsing", "indexing"].includes(uploadPhase);
 
   useEffect(() => {
     scrollRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -369,6 +376,7 @@ export default function Home() {
     return () => {
       uploadRequestRef.current?.abort();
       generationControllerRef.current?.abort();
+      ocrControllerRef.current?.abort();
     };
   }, []);
 
@@ -392,6 +400,7 @@ export default function Home() {
         setDocumentIndex(snapshot.documentIndex);
         setMessages(snapshot.messages);
         setMode(snapshot.mode);
+        setOcrMode(snapshot.ocrMode ?? "none");
         if (snapshot.documentIndex) setUploadPhase("ready");
         const latestAssistant = [...snapshot.messages].reverse().find((message) => message.role === "assistant");
         setActiveSources(latestAssistant?.sources ?? []);
@@ -414,11 +423,12 @@ export default function Home() {
         documentIndex,
         messages,
         mode,
+        ocrMode,
         savedAt: Date.now(),
       }).catch((error) => console.error("Workspace persistence failed", error));
     }, 300);
     return () => window.clearTimeout(timer);
-  }, [documentIndex, hydrated, messages, mode]);
+  }, [documentIndex, hydrated, messages, mode, ocrMode]);
 
   const recentHistory = useMemo(
     () =>
@@ -430,6 +440,8 @@ export default function Home() {
   );
 
   const cancelUpload = () => {
+    ocrControllerRef.current?.abort();
+    ocrControllerRef.current = null;
     uploadRequestRef.current?.abort();
     uploadRequestRef.current = null;
     setUploadPhase(documentIndex ? "ready" : "idle");
@@ -437,7 +449,7 @@ export default function Home() {
     setUploadDetail(null);
   };
 
-  const processDocument = (file: File) => {
+  const processDocument = async (file: File) => {
     lastUploadFileRef.current = file;
     setRetryAvailable(true);
     const extension = file.name.toLowerCase().split(".").pop();
@@ -456,9 +468,58 @@ export default function Home() {
     setRequestError(null);
     setUploadProgress(0);
     setUploadDetail(null);
-    setUploadPhase("uploading");
     const formData = new FormData();
     formData.append("file", file);
+    formData.append("ocrMode", ocrMode);
+
+    if (ocrMode === "force") {
+      const controller = new AbortController();
+      ocrControllerRef.current = controller;
+      setUploadPhase("preparing_ocr");
+      try {
+        const manifest = await runBrowserOcr(file, {
+          signal: controller.signal,
+          onProgress: (progress) => {
+            const phase: UploadPhase = progress.phase === "preparing"
+              ? "preparing_ocr"
+              : progress.phase === "rendering"
+                ? "rendering"
+                : "ocr";
+            const pageProgress = progress.total > 0
+              ? ((Math.max(0, progress.current - 1) + (progress.progress ?? 0)) / progress.total) * 100
+              : 0;
+            setUploadPhase(phase);
+            setUploadDetail({
+              current: progress.current,
+              total: progress.total || null,
+              message: progress.message,
+            });
+            setUploadProgress(Math.max(0, Math.min(100, Math.round(pageProgress))));
+          },
+        });
+        formData.append("ocrManifest", JSON.stringify(manifest));
+      } catch (error) {
+        if (controller.signal.aborted || (error instanceof DOMException && error.name === "AbortError")) {
+          setUploadPhase(documentIndex ? "ready" : "idle");
+          setUploadProgress(0);
+          setUploadDetail(null);
+          return;
+        }
+        setUploadError({
+          code: "BROWSER_OCR_FAILED",
+          message: error instanceof Error ? error.message : "浏览器 OCR 失败，请关闭 OCR 或更换文件后重试。",
+          details: { canRetry: true },
+        });
+        setUploadPhase("error");
+        return;
+      } finally {
+        if (ocrControllerRef.current === controller) ocrControllerRef.current = null;
+      }
+    }
+
+    setUploadProgress(0);
+    setUploadDetail(null);
+    setUploadPhase("uploading");
 
     const xhr = new XMLHttpRequest();
     let responseOffset = 0;
@@ -568,7 +629,7 @@ export default function Home() {
     event.preventDefault();
     setDragging(false);
     const file = event.dataTransfer.files?.[0];
-    if (file) processDocument(file);
+    if (file) void processDocument(file);
   };
 
   const askAI = async (customText?: string) => {
@@ -743,6 +804,38 @@ export default function Home() {
               )}
             </div>
 
+            <fieldset className="mb-3" disabled={uploadBusy}>
+              <legend className="sr-only">OCR 处理模式</legend>
+              <div className="grid grid-cols-2 gap-1 rounded-xl bg-slate-100 p-1">
+                {([
+                  ["none", "不使用 OCR"],
+                  ["force", "全页 OCR"],
+                ] as const).map(([value, label]) => (
+                  <label
+                    key={value}
+                    className={`cursor-pointer rounded-lg px-2 py-2 text-center text-xs font-semibold transition ${
+                      ocrMode === value ? "bg-white text-blue-700 shadow-sm" : "text-slate-500 hover:text-slate-700"
+                    } ${uploadBusy ? "cursor-not-allowed opacity-60" : ""}`}
+                  >
+                    <input
+                      type="radio"
+                      name="ocr-mode"
+                      value={value}
+                      checked={ocrMode === value}
+                      onChange={() => setOcrMode(value)}
+                      className="sr-only"
+                    />
+                    {label}
+                  </label>
+                ))}
+              </div>
+              <p className="mt-1.5 text-[11px] leading-4 text-slate-400">
+                {ocrMode === "force"
+                  ? "每页在当前浏览器中识别，耗时和内存占用更高。"
+                  : "读取文件原生文字，处理速度最快。"}
+              </p>
+            </fieldset>
+
             <label
               className={`block cursor-pointer rounded-2xl border-2 border-dashed p-4 transition ${
                 dragging
@@ -765,7 +858,7 @@ export default function Home() {
                 disabled={uploadBusy}
                 onChange={(event) => {
                   const file = event.target.files?.[0];
-                  if (file) processDocument(file);
+                  if (file) void processDocument(file);
                   event.target.value = "";
                 }}
               />
@@ -797,7 +890,7 @@ export default function Home() {
                   onClick={(event) => {
                     event.preventDefault();
                     event.stopPropagation();
-                    if (lastUploadFileRef.current) processDocument(lastUploadFileRef.current);
+                    if (lastUploadFileRef.current) void processDocument(lastUploadFileRef.current);
                   }}
                   className="mt-3 inline-flex items-center gap-1.5 rounded-lg bg-white px-2.5 py-1.5 text-xs font-semibold text-red-700 shadow-sm hover:bg-red-100"
                 >
@@ -818,6 +911,12 @@ export default function Home() {
                     <p className="mt-1 text-[11px] text-emerald-700/80">
                       {documentIndex.retrievalMode === "hybrid" ? "语义＋关键词混合索引" : "关键词索引（语义服务已降级）"}
                     </p>
+                    {documentIndex.ocr?.mode === "force" && (
+                      <p className="mt-1 text-[11px] text-emerald-700/80">
+                        全页 OCR · 成功 {documentIndex.ocr.successfulPageCount}/{documentIndex.ocr.totalPageCount} 页
+                        {documentIndex.ocr.averageConfidence != null ? ` · 平均置信度 ${documentIndex.ocr.averageConfidence}%` : ""}
+                      </p>
+                    )}
                     {documentIndex.truncated && <p className="mt-2 text-xs text-amber-700">课件较长，已在安全上限内建立索引。</p>}
                   </div>
                 </div>

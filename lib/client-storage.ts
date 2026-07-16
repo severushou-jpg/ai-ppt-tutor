@@ -1,4 +1,4 @@
-import type { ChatMessage, DocumentIndex, LearningMode } from "@/app/types";
+import type { ChatMessage, DocumentIndex, LearningMode, OcrMode } from "@/app/types";
 
 const DATABASE_NAME = "ai-ppt-tutor";
 const STORE_NAME = "workspace";
@@ -9,6 +9,7 @@ export interface WorkspaceSnapshot {
   documentIndex: DocumentIndex | null;
   messages: ChatMessage[];
   mode: LearningMode;
+  ocrMode?: OcrMode;
   savedAt: number;
 }
 

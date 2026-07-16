@@ -9,6 +9,7 @@ import {
   EMBEDDING_MODEL,
   embedDocumentChunks,
 } from "@/lib/dashscope-retrieval.js";
+import { OCR_LIMITS } from "@/lib/ocr.js";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -36,8 +37,8 @@ function errorPayload(error) {
   return { code: "INTERNAL_ERROR", message: "课件处理失败，请稍后重试。", status: 500 };
 }
 
-async function processDocument(file, onProgress, signal) {
-  const document = await parseDocument(file, { onProgress });
+async function processDocument(file, onProgress, signal, ocrMode, ocrManifest) {
+  const document = await parseDocument(file, { onProgress, ocrMode, ocrManifest });
   const apiKey = process.env.DASHSCOPE_API_KEY;
   if (!apiKey) return { ...document, retrievalMode: "lexical", embeddingDimensions: 0 };
 
@@ -64,7 +65,7 @@ async function processDocument(file, onProgress, signal) {
   }
 }
 
-function streamDocument(file, signal) {
+function streamDocument(file, signal, ocrMode, ocrManifest) {
   const encoder = new TextEncoder();
   return new Response(
     new ReadableStream({
@@ -72,7 +73,13 @@ function streamDocument(file, signal) {
         const send = (event) => controller.enqueue(encoder.encode(`${JSON.stringify(event)}\n`));
         void (async () => {
           try {
-            const document = await processDocument(file, (progress) => send({ type: "progress", ...progress }), signal);
+            const document = await processDocument(
+              file,
+              (progress) => send({ type: "progress", ...progress }),
+              signal,
+              ocrMode,
+              ocrManifest,
+            );
             send({ type: "complete", document });
           } catch (error) {
             const payload = errorPayload(error);
@@ -95,7 +102,7 @@ function streamDocument(file, signal) {
 
 export async function POST(request) {
   const contentLength = Number(request.headers.get("content-length") ?? 0);
-  const requestLimit = DOCUMENT_LIMITS.maxFileBytes + 1024 * 1024;
+  const requestLimit = DOCUMENT_LIMITS.maxFileBytes + OCR_LIMITS.maxManifestBytes + 1024 * 1024;
   if (contentLength > requestLimit) {
     return jsonResponse(
       {
@@ -111,10 +118,12 @@ export async function POST(request) {
   try {
     const formData = await request.formData();
     const file = formData.get("file");
+    const ocrMode = formData.get("ocrMode") === "force" ? "force" : "none";
+    const ocrManifest = formData.get("ocrManifest");
     if (request.headers.get("accept")?.includes("application/x-ndjson")) {
-      return streamDocument(file, request.signal);
+      return streamDocument(file, request.signal, ocrMode, ocrManifest);
     }
-    const document = await processDocument(file, undefined, request.signal);
+    const document = await processDocument(file, undefined, request.signal, ocrMode, ocrManifest);
     return jsonResponse({ document });
   } catch (error) {
     const payload = errorPayload(error);
