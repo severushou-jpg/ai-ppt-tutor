@@ -3,78 +3,106 @@ import type {
   BrowserOcrProgress,
   OcrManifest,
   OcrPageResult,
+  RenderedPage,
+  VisualCandidate,
 } from "./types";
+import type Tesseract from "tesseract.js";
 import { renderPdfPages, renderPptxSlides } from "./renderers";
+import { detectVisualCandidate } from "./visual-detector";
 
 const OCR_LANGUAGES = ["chi_sim", "eng"];
+const MAX_VISUAL_CANDIDATES = 8;
+const AUTO_OCR_TEXT_THRESHOLD = 120;
 
 function fileExtension(file: File) {
   return file.name.toLowerCase().split(".").pop() ?? "";
 }
 
-export async function runBrowserOcr(file: File, options: BrowserOcrOptions): Promise<OcrManifest> {
+export async function runBrowserDocumentAnalysis(
+  file: File,
+  options: BrowserOcrOptions,
+): Promise<OcrManifest> {
   const sourceType = fileExtension(file) === "pptx" ? "pptx" : "pdf";
-  if (options.signal.aborted) throw new DOMException("OCR processing was aborted", "AbortError");
+  if (options.signal.aborted) throw new DOMException("Document analysis was aborted", "AbortError");
   options.onProgress?.({
     phase: "preparing",
     current: 0,
     total: 0,
-    message: "正在加载中英文 OCR 引擎",
+    message: options.mode === "auto" ? "正在检查文字层和视觉内容" : "正在准备中英文 OCR 引擎",
   });
-  const { createWorker, OEM } = await import("tesseract.js");
-  if (options.signal.aborted) throw new DOMException("OCR processing was aborted", "AbortError");
+
   let activePage = 0;
   let totalPages = 0;
-  const workerPromise = createWorker(OCR_LANGUAGES, OEM.LSTM_ONLY, {
-    logger: (message) => {
-      if (message.status !== "recognizing text") return;
-      options.onProgress?.({
-        phase: "recognizing",
-        current: activePage,
-        total: totalPages,
-        progress: message.progress,
-        message: `正在识别${sourceType === "pptx" ? "幻灯片" : "页面"} ${activePage}/${totalPages}`,
-      });
-    },
-  });
-  const worker = await new Promise<Awaited<typeof workerPromise>>((resolve, reject) => {
-    const abortInitialization = () => {
-      void workerPromise.then((createdWorker) => createdWorker.terminate()).catch(() => undefined);
-      reject(new DOMException("OCR processing was aborted", "AbortError"));
-    };
-    options.signal.addEventListener("abort", abortInitialization, { once: true });
-    void workerPromise.then(
-      (createdWorker) => {
-        options.signal.removeEventListener("abort", abortInitialization);
+  let inspectedPageCount = 0;
+  const workerState: {
+    worker: Tesseract.Worker | null;
+    promise: Promise<Tesseract.Worker> | null;
+  } = { worker: null, promise: null };
+  const pages: OcrPageResult[] = [];
+  const visuals: VisualCandidate[] = [];
+
+  const getWorker = async () => {
+    if (workerState.worker) return workerState.worker;
+    if (!workerState.promise) {
+      workerState.promise = (async () => {
+        const { createWorker, OEM } = await import("tesseract.js");
+        const created = await createWorker(OCR_LANGUAGES, OEM.LSTM_ONLY, {
+          logger: (message) => {
+            if (message.status !== "recognizing text") return;
+            options.onProgress?.({
+              phase: "recognizing",
+              current: activePage,
+              total: totalPages,
+              progress: message.progress,
+              message: `正在识别${sourceType === "pptx" ? "幻灯片" : "页面"} ${activePage}/${totalPages}`,
+            });
+          },
+        });
         if (options.signal.aborted) {
-          void createdWorker.terminate();
-          reject(new DOMException("OCR processing was aborted", "AbortError"));
-          return;
+          await created.terminate();
+          throw new DOMException("Document analysis was aborted", "AbortError");
         }
-        resolve(createdWorker);
-      },
-      (error) => {
-        options.signal.removeEventListener("abort", abortInitialization);
-        reject(error);
-      },
-    );
-  });
+        workerState.worker = created;
+        return created;
+      })();
+    }
+    return workerState.promise;
+  };
+
   const abortWorker = () => {
-    void worker.terminate();
+    void workerState.worker?.terminate();
   };
   options.signal.addEventListener("abort", abortWorker, { once: true });
-  const pages: OcrPageResult[] = [];
-  const consume = async (
-    rendered: { number: number; canvas: HTMLCanvasElement; release: () => void },
-    current: number,
-    total: number,
-  ) => {
+
+  const rememberVisual = (candidate: VisualCandidate | null) => {
+    if (!candidate) return;
+    visuals.push(candidate);
+    visuals.sort((left, right) => right.score - left.score);
+    while (visuals.length > MAX_VISUAL_CANDIDATES) visuals.pop();
+  };
+
+  const consume = async (rendered: RenderedPage, current: number, total: number) => {
     activePage = current;
     totalPages = total;
+    inspectedPageCount = Math.max(inspectedPageCount, current);
+    const kind = sourceType === "pptx" ? "slide" : "page";
+    rememberVisual(detectVisualCandidate(
+      rendered.canvas,
+      { number: rendered.number, kind },
+      rendered.nativeTextLength,
+    ));
+
+    const shouldRecognize = options.mode === "force" || rendered.nativeTextLength < AUTO_OCR_TEXT_THRESHOLD;
+    if (!shouldRecognize) {
+      rendered.release();
+      return;
+    }
+
     const startedAt = performance.now();
     try {
-      if (options.signal.aborted) throw new DOMException("OCR processing was aborted", "AbortError");
-      const result = await worker.recognize(rendered.canvas, { rotateAuto: true });
+      if (options.signal.aborted) throw new DOMException("Document analysis was aborted", "AbortError");
+      const activeWorker = await getWorker();
+      const result = await activeWorker.recognize(rendered.canvas, { rotateAuto: true });
       pages.push({
         number: rendered.number,
         text: result.data.text.trim(),
@@ -103,19 +131,27 @@ export async function runBrowserOcr(file: File, options: BrowserOcrOptions): Pro
     } else {
       await renderPdfPages(file, options.signal, onProgress, consume);
     }
-    if (pages.length === 0 || pages.every((page) => page.status === "failed")) {
-      throw new Error("浏览器未能识别任何页面，请关闭 OCR 或更换文件后重试。");
+    if (options.mode === "force" && (pages.length === 0 || pages.every((page) => page.status === "failed"))) {
+      throw new Error("浏览器未能识别任何页面，请改用自动模式或更换文件后重试。");
     }
     return {
-      version: 1,
-      mode: "force",
+      version: 2,
+      mode: options.mode,
       engine: "tesseract.js",
       sourceType,
       languages: OCR_LANGUAGES,
       pages: pages.sort((left, right) => left.number - right.number),
+      inspectedPageCount,
+      visuals: visuals.sort((left, right) => left.number - right.number),
     };
   } finally {
     options.signal.removeEventListener("abort", abortWorker);
-    await worker.terminate().catch(() => undefined);
+    if (workerState.promise) {
+      const activeWorker = await workerState.promise.catch(() => null);
+      await activeWorker?.terminate().catch(() => undefined);
+    }
   }
 }
+
+/** Backwards-compatible alias used by older integrations. */
+export const runBrowserOcr = runBrowserDocumentAnalysis;

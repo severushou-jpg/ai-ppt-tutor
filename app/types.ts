@@ -1,5 +1,5 @@
-export type LearningMode = "explain" | "qa" | "quiz" | "review";
-export type OcrMode = "none" | "force";
+export type LearningMode = "tutor" | "explain" | "qa" | "quiz" | "review";
+export type OcrMode = "auto" | "none" | "force";
 
 export type UploadPhase =
   | "idle"
@@ -9,6 +9,7 @@ export type UploadPhase =
   | "uploading"
   | "parsing"
   | "indexing"
+  | "vision"
   | "ready"
   | "error";
 
@@ -19,12 +20,24 @@ export interface DocumentChunk {
   number: number;
   label: string;
   title: string;
-  contentType: "prose" | "heading" | "definition" | "list" | "table" | "code";
-  structureTypes?: Array<"prose" | "definition" | "list" | "table" | "code">;
+  contentType: "prose" | "heading" | "definition" | "list" | "table" | "code" | "visual";
+  structureTypes?: Array<"prose" | "definition" | "list" | "table" | "code" | "visual">;
   text: string;
   embedding?: number[];
-  textOrigin?: "native" | "ocr" | "mixed";
+  textOrigin?: "native" | "ocr" | "mixed" | "vision";
   ocrConfidence?: number;
+  evidenceWeight?: number;
+  visual?: VisualEvidence;
+}
+
+export interface VisualEvidence {
+  id: string;
+  kind: "chart" | "table" | "diagram" | "code" | "image" | "unknown";
+  imageDataUrl: string;
+  crop: { x: number; y: number; width: number; height: number };
+  confidence: number;
+  model?: string;
+  altText?: string;
 }
 
 export interface OcrSummary {
@@ -35,6 +48,15 @@ export interface OcrSummary {
   failedPageCount: number;
   averageConfidence?: number;
   durationMs?: number;
+  inspectedPageCount?: number;
+  automaticallySelectedPageCount?: number;
+}
+
+export interface VisionSummary {
+  candidateCount: number;
+  analyzedCount: number;
+  failedCount: number;
+  model?: string;
 }
 
 export interface DocumentIndex {
@@ -51,6 +73,7 @@ export interface DocumentIndex {
   embeddingModel?: string;
   embeddingDimensions?: number;
   ocr?: OcrSummary;
+  vision?: VisionSummary;
   chunks: DocumentChunk[];
 }
 
@@ -65,6 +88,10 @@ export interface CitationSource {
   highlight?: string;
   title?: string;
   contentType?: DocumentChunk["contentType"];
+  textOrigin?: DocumentChunk["textOrigin"];
+  ocrConfidence?: number;
+  evidenceWeight?: number;
+  visual?: VisualEvidence;
   score: number;
 }
 
@@ -93,9 +120,11 @@ export interface RetrievalMetadata {
   mode: "lexical" | "hybrid";
   reranked: boolean;
   candidateCount: number;
-  strategy?: "focused" | "document_coverage";
+  strategy?: "focused" | "document_coverage" | "multi_query";
   indexedPageCount?: number;
   selectedPageCount?: number;
+  queryCount?: number;
+  visualCandidateCount?: number;
 }
 
 export interface ChatMessage {

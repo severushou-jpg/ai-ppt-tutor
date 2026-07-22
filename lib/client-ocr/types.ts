@@ -1,4 +1,4 @@
-export type OcrMode = "none" | "force";
+export type OcrMode = "auto" | "none" | "force";
 
 export type BrowserOcrPhase = "preparing" | "rendering" | "recognizing";
 
@@ -19,21 +19,35 @@ export interface OcrPageResult {
 }
 
 export interface OcrManifest {
-  version: 1;
-  mode: "force";
+  version: 2;
+  mode: "auto" | "force";
   engine: "tesseract.js";
   sourceType: "pdf" | "pptx";
   languages: string[];
   pages: OcrPageResult[];
+  inspectedPageCount: number;
+  visuals: VisualCandidate[];
+}
+
+export interface VisualCandidate {
+  id: string;
+  number: number;
+  kind: "page" | "slide";
+  imageDataUrl: string;
+  crop: { x: number; y: number; width: number; height: number };
+  score: number;
+  nativeTextLength: number;
 }
 
 export interface RenderedPage {
   number: number;
   canvas: HTMLCanvasElement;
+  nativeTextLength: number;
   release: () => void;
 }
 
 export interface BrowserOcrOptions {
   signal: AbortSignal;
+  mode: "auto" | "force";
   onProgress?: (progress: BrowserOcrProgress) => void;
 }

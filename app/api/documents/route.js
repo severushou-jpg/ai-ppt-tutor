@@ -9,10 +9,11 @@ import {
   EMBEDDING_MODEL,
   embedDocumentChunks,
 } from "@/lib/dashscope-retrieval.js";
-import { OCR_LIMITS } from "@/lib/ocr.js";
+import { OCR_LIMITS, parseOcrManifest } from "@/lib/ocr.js";
+import { analyzeVisualCandidates } from "@/lib/visual-analysis.js";
 
 export const runtime = "nodejs";
-export const maxDuration = 60;
+export const maxDuration = 120;
 
 function jsonResponse(body, status = 200) {
   return NextResponse.json(body, {
@@ -40,10 +41,29 @@ function errorPayload(error) {
 async function processDocument(file, onProgress, signal, ocrMode, ocrManifest) {
   const document = await parseDocument(file, { onProgress, ocrMode, ocrManifest });
   const apiKey = process.env.DASHSCOPE_API_KEY;
-  if (!apiKey) return { ...document, retrievalMode: "lexical", embeddingDimensions: 0 };
+  const parsedManifest = parseOcrManifest(ocrManifest, ocrMode);
+  const vision = await analyzeVisualCandidates(parsedManifest, apiKey, {
+    signal,
+    fileName: document.name,
+    onProgress: ({ current, total, message }) => onProgress?.({
+      phase: "vision",
+      current,
+      total,
+      message,
+    }),
+  });
+  const chunksWithVisuals = [...document.chunks, ...vision.chunks];
+  const enrichedDocument = {
+    ...document,
+    chunks: chunksWithVisuals,
+    chunkCount: chunksWithVisuals.length,
+    characterCount: document.characterCount + vision.chunks.reduce((sum, chunk) => sum + chunk.text.length, 0),
+    vision: vision.summary,
+  };
+  if (!apiKey) return { ...enrichedDocument, retrievalMode: "lexical", embeddingDimensions: 0 };
 
   try {
-    const chunks = await embedDocumentChunks(document.chunks, apiKey, {
+    const chunks = await embedDocumentChunks(chunksWithVisuals, apiKey, {
       signal,
       onProgress: ({ completed, total }) => onProgress?.({
         phase: "embedding",
@@ -53,7 +73,7 @@ async function processDocument(file, onProgress, signal, ocrMode, ocrManifest) {
       }),
     });
     return {
-      ...document,
+      ...enrichedDocument,
       chunks,
       retrievalMode: "hybrid",
       embeddingModel: EMBEDDING_MODEL,
@@ -61,7 +81,7 @@ async function processDocument(file, onProgress, signal, ocrMode, ocrManifest) {
     };
   } catch (error) {
     console.error("Document embedding failed; using lexical retrieval", { message: error?.message });
-    return { ...document, retrievalMode: "lexical", embeddingDimensions: 0 };
+    return { ...enrichedDocument, retrievalMode: "lexical", embeddingDimensions: 0 };
   }
 }
 
@@ -118,7 +138,8 @@ export async function POST(request) {
   try {
     const formData = await request.formData();
     const file = formData.get("file");
-    const ocrMode = formData.get("ocrMode") === "force" ? "force" : "none";
+    const requestedOcrMode = formData.get("ocrMode");
+    const ocrMode = ["auto", "force"].includes(requestedOcrMode) ? requestedOcrMode : "none";
     const ocrManifest = formData.get("ocrManifest");
     if (request.headers.get("accept")?.includes("application/x-ndjson")) {
       return streamDocument(file, request.signal, ocrMode, ocrManifest);
