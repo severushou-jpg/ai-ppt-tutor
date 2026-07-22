@@ -9,6 +9,7 @@ import {
   type KeyboardEvent,
 } from "react";
 import ReactMarkdown from "react-markdown";
+import Image from "next/image";
 import {
   BookOpen,
   Brain,
@@ -51,10 +52,10 @@ import type {
   UploadPhase,
 } from "./types";
 import { clearWorkspace, loadWorkspace, saveWorkspace } from "@/lib/client-storage";
-import { runBrowserOcr } from "@/lib/client-ocr/controller";
+import { runBrowserDocumentAnalysis } from "@/lib/client-ocr/controller";
 
 const MAX_FILE_BYTES = 20 * 1024 * 1024;
-const CURRENT_DOCUMENT_INDEX_VERSION = 3;
+const CURRENT_DOCUMENT_INDEX_VERSION = 4;
 
 const MODES: Record<
   LearningMode,
@@ -67,6 +68,14 @@ const MODES: Record<
     suggestions: string[];
   }
 > = {
+  tutor: {
+    label: "导师教学",
+    shortLabel: "教学",
+    description: "诊断、讲解、练习与掌握检查",
+    icon: Brain,
+    accent: "bg-cyan-50 text-cyan-800 border-cyan-200",
+    suggestions: ["先诊断我的基础，再带我学完整份课件。", "用提问和练习带我真正掌握第一个核心概念。"],
+  },
   explain: {
     label: "深入讲解",
     shortLabel: "讲解",
@@ -109,6 +118,7 @@ const UPLOAD_COPY: Record<UploadPhase, { title: string; detail: string }> = {
   uploading: { title: "正在上传课件", detail: "请保持页面打开" },
   parsing: { title: "正在解析文字与结构", detail: "按页或幻灯片保留来源" },
   indexing: { title: "正在建立课件索引", detail: "马上就可以开始学习" },
+  vision: { title: "正在理解图表与图片", detail: "视觉模型正在分析可用于学习的区域" },
   ready: { title: "课件已准备好", detail: "现在可以讲解、问答或练习" },
   error: { title: "课件处理失败", detail: "请根据提示重试" },
 };
@@ -130,10 +140,12 @@ function MessageCard({
   message,
   onCitationClick,
   onFeedback,
+  onTutorAction,
 }: {
   message: ChatMessage;
   onCitationClick: (sourceId: number, sources: CitationSource[]) => void;
   onFeedback: (messageId: string, feedback: "helpful" | "inaccurate") => void;
+  onTutorAction: (prompt: string) => void;
 }) {
   const [showAnswers, setShowAnswers] = useState(false);
   if (message.role === "user") {
@@ -245,12 +257,25 @@ function MessageCard({
           ))}
         </footer>
       )}
+      {message.mode === "tutor" && !message.refused && (
+        <div className="flex flex-wrap gap-2 border-t border-cyan-100 bg-cyan-50/60 px-5 py-3">
+          <button type="button" onClick={() => onTutorAction("请进入掌握检查阶段，先只给我一道需要主动回答的问题，不要公布答案。") } className="rounded-lg border border-cyan-200 bg-white px-3 py-1.5 text-xs font-semibold text-cyan-800 hover:bg-cyan-100">
+            进行掌握检查
+          </button>
+          <button type="button" onClick={() => onTutorAction("我还没有真正理解。请换一种更直观的解释，并用课件中的具体例子一步步引导我。") } className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-100">
+            换种方式讲
+          </button>
+        </div>
+      )}
       <div className="flex items-center justify-between border-t border-slate-100 px-5 py-2.5">
         <span className="text-[11px] text-slate-400">
           {message.retrieval?.strategy === "document_coverage"
             ? `全文覆盖 · ${message.retrieval.selectedPageCount ?? message.retrieval.candidateCount}/${message.retrieval.indexedPageCount ?? message.retrieval.candidateCount} 页`
-            : message.retrieval?.mode === "hybrid" ? "关键词＋语义检索" : "关键词检索"}
+            : message.retrieval?.strategy === "multi_query"
+              ? `多查询混合检索 · ${message.retrieval.queryCount ?? 1} 路召回`
+              : message.retrieval?.mode === "hybrid" ? "关键词＋语义检索" : "关键词检索"}
           {message.retrieval?.strategy !== "document_coverage" && message.retrieval?.reranked ? " · 已重排序" : ""}
+          {(message.retrieval?.visualCandidateCount ?? 0) > 0 ? ` · ${message.retrieval?.visualCandidateCount} 条视觉证据` : ""}
         </span>
         <div className="flex items-center gap-1" aria-label="回答反馈">
           <button type="button" onClick={() => onFeedback(message.id, "helpful")} aria-label="回答有帮助" className={`rounded-lg p-1.5 transition ${message.feedback === "helpful" ? "bg-emerald-50 text-emerald-700" : "text-slate-400 hover:bg-slate-50 hover:text-slate-700"}`}><ThumbsUp size={14} /></button>
@@ -329,7 +354,25 @@ function SourcePanel({
                   </span>
                 </div>
                 {source.title && <p className="mt-3 truncate text-xs font-semibold text-slate-700">{source.title}</p>}
+                {source.visual?.imageDataUrl && (
+                  <Image
+                    src={source.visual.imageDataUrl}
+                    alt={source.visual.altText || `${source.label}视觉证据`}
+                    width={960}
+                    height={540}
+                    unoptimized
+                    className="mt-3 max-h-48 w-full rounded-lg border border-slate-200 bg-white object-contain"
+                  />
+                )}
                 <p className="mt-2 line-clamp-8 text-xs leading-5 text-slate-600"><HighlightedExcerpt source={source} /></p>
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-500">
+                    {source.textOrigin === "vision" ? "图片分析" : source.textOrigin === "ocr" ? "OCR" : source.textOrigin === "mixed" ? "原文＋OCR" : "原生文字"}
+                  </span>
+                  {source.ocrConfidence != null && (
+                    <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700">OCR {Math.round(source.ocrConfidence)}%</span>
+                  )}
+                </div>
                 <p className="mt-3 truncate text-[11px] text-slate-400">{source.fileName}</p>
               </button>
             );
@@ -349,8 +392,8 @@ export default function Home() {
   const [retryAvailable, setRetryAvailable] = useState(false);
   const [uploadError, setUploadError] = useState<ApiError | null>(null);
   const [requestError, setRequestError] = useState<string | null>(null);
-  const [mode, setMode] = useState<LearningMode>("explain");
-  const [ocrMode, setOcrMode] = useState<OcrMode>("none");
+  const [mode, setMode] = useState<LearningMode>("tutor");
+  const [ocrMode, setOcrMode] = useState<OcrMode>("auto");
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [dragging, setDragging] = useState(false);
@@ -366,7 +409,7 @@ export default function Home() {
   const lastUploadFileRef = useRef<File | null>(null);
 
   const activeMode = MODES[mode];
-  const uploadBusy = ["preparing_ocr", "rendering", "ocr", "uploading", "parsing", "indexing"].includes(uploadPhase);
+  const uploadBusy = ["preparing_ocr", "rendering", "ocr", "uploading", "parsing", "indexing", "vision"].includes(uploadPhase);
 
   useEffect(() => {
     scrollRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -400,7 +443,7 @@ export default function Home() {
         setDocumentIndex(snapshot.documentIndex);
         setMessages(snapshot.messages);
         setMode(snapshot.mode);
-        setOcrMode(snapshot.ocrMode ?? "none");
+        setOcrMode(snapshot.ocrMode ?? "auto");
         if (snapshot.documentIndex) setUploadPhase("ready");
         const latestAssistant = [...snapshot.messages].reverse().find((message) => message.role === "assistant");
         setActiveSources(latestAssistant?.sources ?? []);
@@ -472,13 +515,14 @@ export default function Home() {
     formData.append("file", file);
     formData.append("ocrMode", ocrMode);
 
-    if (ocrMode === "force") {
+    if (ocrMode !== "none") {
       const controller = new AbortController();
       ocrControllerRef.current = controller;
       setUploadPhase("preparing_ocr");
       try {
-        const manifest = await runBrowserOcr(file, {
+        const manifest = await runBrowserDocumentAnalysis(file, {
           signal: controller.signal,
+          mode: ocrMode,
           onProgress: (progress) => {
             const phase: UploadPhase = progress.phase === "preparing"
               ? "preparing_ocr"
@@ -507,7 +551,7 @@ export default function Home() {
         }
         setUploadError({
           code: "BROWSER_OCR_FAILED",
-          message: error instanceof Error ? error.message : "浏览器 OCR 失败，请关闭 OCR 或更换文件后重试。",
+          message: error instanceof Error ? error.message : "浏览器文档分析失败，请关闭 OCR 或更换文件后重试。",
           details: { canRetry: true },
         });
         setUploadPhase("error");
@@ -547,7 +591,7 @@ export default function Home() {
 
     const applyStreamEvent = (event: {
       type?: "progress" | "complete" | "error";
-      phase?: "parsing" | "indexing" | "embedding";
+      phase?: "parsing" | "indexing" | "embedding" | "vision";
       current?: number;
       total?: number | null;
       message?: string;
@@ -555,7 +599,9 @@ export default function Home() {
       error?: ApiError;
     }) => {
       if (event.type === "progress" && event.phase) {
-        const phase = event.phase === "parsing" ? "parsing" : "indexing";
+        const phase: UploadPhase = event.phase === "parsing"
+          ? "parsing"
+          : event.phase === "vision" ? "vision" : "indexing";
         const current = Number(event.current ?? 0);
         const total = event.total == null ? null : Number(event.total);
         setUploadPhase(phase);
@@ -806,8 +852,9 @@ export default function Home() {
 
             <fieldset className="mb-3" disabled={uploadBusy}>
               <legend className="sr-only">OCR 处理模式</legend>
-              <div className="grid grid-cols-2 gap-1 rounded-xl bg-slate-100 p-1">
+              <div className="grid grid-cols-3 gap-1 rounded-xl bg-slate-100 p-1">
                 {([
+                  ["auto", "自动（推荐）"],
                   ["none", "不使用 OCR"],
                   ["force", "全页 OCR"],
                 ] as const).map(([value, label]) => (
@@ -830,9 +877,11 @@ export default function Home() {
                 ))}
               </div>
               <p className="mt-1.5 text-[11px] leading-4 text-slate-400">
-                {ocrMode === "force"
-                  ? "每页在当前浏览器中识别，耗时和内存占用更高。"
-                  : "读取文件原生文字，处理速度最快。"}
+                {ocrMode === "auto"
+                  ? "自动识别缺少文字层的页面，并检测值得分析的图表区域。"
+                  : ocrMode === "force"
+                    ? "每页在当前浏览器中识别，耗时和内存占用更高。"
+                    : "只读取文件原生文字，不会生成图片证据。"}
               </p>
             </fieldset>
 
@@ -911,10 +960,15 @@ export default function Home() {
                     <p className="mt-1 text-[11px] text-emerald-700/80">
                       {documentIndex.retrievalMode === "hybrid" ? "语义＋关键词混合索引" : "关键词索引（语义服务已降级）"}
                     </p>
-                    {documentIndex.ocr?.mode === "force" && (
+                    {documentIndex.ocr && documentIndex.ocr.mode !== "none" && (
                       <p className="mt-1 text-[11px] text-emerald-700/80">
-                        全页 OCR · 成功 {documentIndex.ocr.successfulPageCount}/{documentIndex.ocr.totalPageCount} 页
+                        {documentIndex.ocr.mode === "auto" ? "自动 OCR" : "全页 OCR"} · 成功 {documentIndex.ocr.successfulPageCount}/{documentIndex.ocr.automaticallySelectedPageCount ?? documentIndex.ocr.totalPageCount} 个选定页面
                         {documentIndex.ocr.averageConfidence != null ? ` · 平均置信度 ${documentIndex.ocr.averageConfidence}%` : ""}
+                      </p>
+                    )}
+                    {(documentIndex.vision?.analyzedCount ?? 0) > 0 && (
+                      <p className="mt-1 text-[11px] text-emerald-700/80">
+                        图片证据 · 已分析 {documentIndex.vision?.analyzedCount}/{documentIndex.vision?.candidateCount} 个候选区域
                       </p>
                     )}
                     {documentIndex.truncated && <p className="mt-2 text-xs text-amber-700">课件较长，已在安全上限内建立索引。</p>}
@@ -1023,7 +1077,7 @@ export default function Home() {
             ) : (
               <div className="space-y-5 pb-6">
                 {messages.map((message) => (
-                  <MessageCard key={message.id} message={message} onCitationClick={handleCitationClick} onFeedback={handleFeedback} />
+                  <MessageCard key={message.id} message={message} onCitationClick={handleCitationClick} onFeedback={handleFeedback} onTutorAction={(prompt) => void askAI(prompt)} />
                 ))}
                 {loading && (
                   <div className="max-w-3xl rounded-2xl border border-slate-200 bg-white p-5 shadow-sm" aria-live="polite">
