@@ -37,6 +37,7 @@ import {
   Square,
   ThumbsDown,
   ThumbsUp,
+  Trash2,
   UploadCloud,
   X,
 } from "lucide-react";
@@ -46,16 +47,47 @@ import type {
   CitationSource,
   DocumentIndex,
   LearningMode,
+  MasteryStatus,
   OcrMode,
   RetrievalMetadata,
   StructuredAnswer,
+  StudyProgress,
   UploadPhase,
 } from "./types";
-import { clearWorkspace, loadWorkspace, saveWorkspace } from "@/lib/client-storage";
+import {
+  cacheDocument,
+  clearWorkspace,
+  deleteProcessingJob,
+  getCachedDocument,
+  listProcessingJobs,
+  listWorkspaces,
+  loadWorkspace,
+  saveProcessingJob,
+  saveWorkspace,
+  setActiveWorkspaceId,
+  type ProcessingJob,
+  type WorkspaceSnapshot,
+  type WorkspaceSummary,
+} from "@/lib/client-storage";
+import {
+  computeFileFingerprint,
+  estimateRemainingMs,
+  fileFromProcessingJob,
+  pipelineProgress,
+} from "@/lib/client-processing";
 import { runBrowserDocumentAnalysis } from "@/lib/client-ocr/controller";
+import type { OcrManifest } from "@/lib/client-ocr/types";
 
 const MAX_FILE_BYTES = 20 * 1024 * 1024;
 const CURRENT_DOCUMENT_INDEX_VERSION = 4;
+const DEFAULT_PROGRESS: StudyProgress = { mastery: "not_started", completedChunkIds: [] };
+
+const MASTERY_COPY: Record<MasteryStatus, string> = {
+  not_started: "未学习",
+  learning: "学习中",
+  mastered: "基本掌握",
+  review_needed: "需要复习",
+};
 
 const MODES: Record<
   LearningMode,
@@ -112,6 +144,7 @@ const MODES: Record<
 
 const UPLOAD_COPY: Record<UploadPhase, { title: string; detail: string }> = {
   idle: { title: "等待上传", detail: "支持 PDF / PPTX，最大 20MB" },
+  hashing: { title: "正在检查课件缓存", detail: "通过 SHA-256 判断是否已经解析过" },
   preparing_ocr: { title: "正在准备 OCR", detail: "首次使用需要加载中英文识别模型" },
   rendering: { title: "正在渲染课件页面", detail: "所有 OCR 处理都在当前浏览器完成" },
   ocr: { title: "正在进行全页 OCR", detail: "请保持页面打开" },
@@ -119,9 +152,17 @@ const UPLOAD_COPY: Record<UploadPhase, { title: string; detail: string }> = {
   parsing: { title: "正在解析文字与结构", detail: "按页或幻灯片保留来源" },
   indexing: { title: "正在建立课件索引", detail: "马上就可以开始学习" },
   vision: { title: "正在理解图表与图片", detail: "视觉模型正在分析可用于学习的区域" },
+  paused: { title: "处理任务可以恢复", detail: "课件文件和已完成阶段已保存在当前浏览器" },
   ready: { title: "课件已准备好", detail: "现在可以讲解、问答或练习" },
   error: { title: "课件处理失败", detail: "请根据提示重试" },
 };
+
+function formatDuration(milliseconds: number | null) {
+  if (milliseconds == null) return null;
+  const seconds = Math.max(1, Math.round(milliseconds / 1000));
+  if (seconds < 60) return `预计剩余约 ${seconds} 秒`;
+  return `预计剩余约 ${Math.ceil(seconds / 60)} 分钟`;
+}
 
 function createId() {
   return globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
@@ -386,6 +427,12 @@ function SourcePanel({
 export default function Home() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [documentIndex, setDocumentIndex] = useState<DocumentIndex | null>(null);
+  const [workspaceId, setWorkspaceId] = useState<string | null>(null);
+  const [workspaceFingerprint, setWorkspaceFingerprint] = useState<string | null>(null);
+  const [workspaceCreatedAt, setWorkspaceCreatedAt] = useState<number>(0);
+  const [workspaceSummaries, setWorkspaceSummaries] = useState<WorkspaceSummary[]>([]);
+  const [studyProgress, setStudyProgress] = useState<StudyProgress>(DEFAULT_PROGRESS);
+  const [processingJob, setProcessingJob] = useState<ProcessingJob | null>(null);
   const [uploadPhase, setUploadPhase] = useState<UploadPhase>("idle");
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadDetail, setUploadDetail] = useState<{ current: number; total: number | null; message: string } | null>(null);
@@ -407,9 +454,13 @@ export default function Home() {
   const generationControllerRef = useRef<AbortController | null>(null);
   const ocrControllerRef = useRef<AbortController | null>(null);
   const lastUploadFileRef = useRef<File | null>(null);
+  const processingJobRef = useRef<ProcessingJob | null>(null);
 
   const activeMode = MODES[mode];
-  const uploadBusy = ["preparing_ocr", "rendering", "ocr", "uploading", "parsing", "indexing", "vision"].includes(uploadPhase);
+  const uploadBusy = ["hashing", "preparing_ocr", "rendering", "ocr", "uploading", "parsing", "indexing", "vision"].includes(uploadPhase);
+  const estimatedRemaining = processingJob?.status === "processing"
+    ? estimateRemainingMs(processingJob.startedAt, processingJob.progress, processingJob.updatedAt)
+    : null;
 
   useEffect(() => {
     scrollRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -423,12 +474,38 @@ export default function Home() {
     };
   }, []);
 
+  const applyWorkspaceSnapshot = (snapshot: WorkspaceSnapshot) => {
+    setWorkspaceId(snapshot.id);
+    setWorkspaceFingerprint(snapshot.fingerprint);
+    setWorkspaceCreatedAt(snapshot.createdAt);
+    setDocumentIndex(snapshot.documentIndex);
+    setMessages(snapshot.messages);
+    setMode(snapshot.mode);
+    setOcrMode(snapshot.ocrMode);
+    setStudyProgress(snapshot.progress);
+    setUploadPhase("ready");
+    const latestAssistant = [...snapshot.messages].reverse().find((message) => message.role === "assistant");
+    setActiveSources(latestAssistant?.sources ?? []);
+    setSelectedSourceId(latestAssistant?.sources?.[0]?.id ?? null);
+  };
+
+  const updateProcessingJob = async (patch: Partial<ProcessingJob>, persist = true) => {
+    const current = processingJobRef.current;
+    if (!current) return null;
+    const next: ProcessingJob = { ...current, ...patch, updatedAt: Date.now() };
+    processingJobRef.current = next;
+    setProcessingJob(next);
+    if (persist) await saveProcessingJob(next);
+    return next;
+  };
+
   useEffect(() => {
     let cancelled = false;
-    void loadWorkspace()
-      .then((snapshot) => {
-        if (cancelled || !snapshot || snapshot.version !== 1) return;
-        if (snapshot.documentIndex && snapshot.documentIndex.indexVersion !== CURRENT_DOCUMENT_INDEX_VERSION) {
+    void Promise.all([loadWorkspace(), listWorkspaces(), listProcessingJobs()])
+      .then(async ([snapshot, summaries, jobs]) => {
+        if (cancelled) return;
+        setWorkspaceSummaries(summaries);
+        if (snapshot?.documentIndex && snapshot.documentIndex.indexVersion !== CURRENT_DOCUMENT_INDEX_VERSION) {
           setDocumentIndex(null);
           setMessages([]);
           setActiveSources([]);
@@ -438,16 +515,25 @@ export default function Home() {
             message: "检索算法已升级，请重新上传课件。旧回答已清除，以免继续显示不完整结果。",
           });
           setUploadPhase("error");
-          return;
+        } else if (snapshot?.version === 2) {
+          applyWorkspaceSnapshot(snapshot);
         }
-        setDocumentIndex(snapshot.documentIndex);
-        setMessages(snapshot.messages);
-        setMode(snapshot.mode);
-        setOcrMode(snapshot.ocrMode ?? "auto");
-        if (snapshot.documentIndex) setUploadPhase("ready");
-        const latestAssistant = [...snapshot.messages].reverse().find((message) => message.role === "assistant");
-        setActiveSources(latestAssistant?.sources ?? []);
-        setSelectedSourceId(latestAssistant?.sources?.[0]?.id ?? null);
+        const recoverable = jobs.find((job) => job.status !== "failed") ?? jobs[0];
+        if (recoverable) {
+          const restored = recoverable.status === "processing"
+            ? { ...recoverable, status: "paused" as const, updatedAt: Date.now(), message: "页面曾关闭，任务可以从已保存阶段继续。" }
+            : recoverable;
+          processingJobRef.current = restored;
+          setProcessingJob(restored);
+          setRetryAvailable(true);
+          if (!snapshot?.documentIndex || restored.status !== "failed") {
+            setUploadPhase(restored.status === "failed" ? "error" : "paused");
+            setUploadProgress(restored.progress);
+            setUploadDetail({ current: restored.current, total: restored.total, message: restored.message });
+            setUploadError(restored.error ?? null);
+          }
+          if (restored !== recoverable) await saveProcessingJob(restored);
+        }
       })
       .catch((error) => console.error("Workspace restore failed", error))
       .finally(() => {
@@ -459,19 +545,24 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    if (!hydrated) return;
+    if (!hydrated || !documentIndex || !workspaceId || !workspaceFingerprint) return;
     const timer = window.setTimeout(() => {
       void saveWorkspace({
-        version: 1,
+        version: 2,
+        id: workspaceId,
+        fingerprint: workspaceFingerprint,
         documentIndex,
         messages,
         mode,
         ocrMode,
+        progress: studyProgress,
+        createdAt: workspaceCreatedAt,
         savedAt: Date.now(),
-      }).catch((error) => console.error("Workspace persistence failed", error));
+      }).then(async () => setWorkspaceSummaries(await listWorkspaces()))
+        .catch((error) => console.error("Workspace persistence failed", error));
     }, 300);
     return () => window.clearTimeout(timer);
-  }, [documentIndex, hydrated, messages, mode, ocrMode]);
+  }, [documentIndex, hydrated, messages, mode, ocrMode, studyProgress, workspaceCreatedAt, workspaceFingerprint, workspaceId]);
 
   const recentHistory = useMemo(
     () =>
@@ -487,12 +578,30 @@ export default function Home() {
     ocrControllerRef.current = null;
     uploadRequestRef.current?.abort();
     uploadRequestRef.current = null;
-    setUploadPhase(documentIndex ? "ready" : "idle");
-    setUploadProgress(0);
-    setUploadDetail(null);
+    void updateProcessingJob({
+      status: "paused",
+      message: "任务已暂停，可稍后从已保存阶段继续。",
+    });
+    setUploadPhase("paused");
+    setUploadDetail((current) => current ? { ...current, message: "任务已暂停，可稍后继续。" } : null);
   };
 
-  const processDocument = async (file: File) => {
+  const discardProcessingJob = async () => {
+    const job = processingJobRef.current;
+    if (!job) return;
+    ocrControllerRef.current?.abort();
+    uploadRequestRef.current?.abort();
+    await deleteProcessingJob(job.id);
+    processingJobRef.current = null;
+    setProcessingJob(null);
+    setRetryAvailable(false);
+    setUploadError(null);
+    setUploadProgress(documentIndex ? 100 : 0);
+    setUploadDetail(null);
+    setUploadPhase(documentIndex ? "ready" : "idle");
+  };
+
+  const processDocument = async (file: File, resumedJob?: ProcessingJob) => {
     lastUploadFileRef.current = file;
     setRetryAvailable(true);
     const extension = file.name.toLowerCase().split(".").pop();
@@ -507,63 +616,157 @@ export default function Home() {
       return;
     }
 
+    const selectedOcrMode = resumedJob?.ocrMode ?? ocrMode;
     setUploadError(null);
     setRequestError(null);
     setUploadProgress(0);
     setUploadDetail(null);
-    const formData = new FormData();
-    formData.append("file", file);
-    formData.append("ocrMode", ocrMode);
+    setUploadPhase("hashing");
 
-    if (ocrMode !== "none") {
+    let fingerprint: string;
+    try {
+      fingerprint = resumedJob?.fingerprint ?? await computeFileFingerprint(file);
+    } catch {
+      setUploadError({ code: "FINGERPRINT_FAILED", message: "无法读取课件文件，请重新选择文件。" });
+      setUploadPhase("error");
+      return;
+    }
+
+    const replacedJob = !resumedJob ? processingJobRef.current : null;
+    if (replacedJob) {
+      await deleteProcessingJob(replacedJob.id);
+      processingJobRef.current = null;
+      setProcessingJob(null);
+    }
+
+    const cached = await getCachedDocument(fingerprint);
+    if (cached?.documentIndex.indexVersion === CURRENT_DOCUMENT_INDEX_VERSION) {
+      const summaries = await listWorkspaces();
+      const existingSummary = summaries.find((workspace) => workspace.fingerprint === fingerprint);
+      const existing = existingSummary ? await loadWorkspace(existingSummary.id) : null;
+      const timestamp = Date.now();
+      const snapshot: WorkspaceSnapshot = existing ?? {
+        version: 2,
+        id: `workspace-${fingerprint.slice(0, 24)}`,
+        fingerprint,
+        documentIndex: cached.documentIndex,
+        messages: [],
+        mode,
+        ocrMode: cached.ocrMode,
+        progress: DEFAULT_PROGRESS,
+        createdAt: timestamp,
+        savedAt: timestamp,
+      };
+      await saveWorkspace(snapshot);
+      if (resumedJob) await deleteProcessingJob(resumedJob.id);
+      processingJobRef.current = null;
+      setProcessingJob(null);
+      applyWorkspaceSnapshot(snapshot);
+      setUploadProgress(100);
+      setUploadDetail({ current: 1, total: 1, message: "已从本机缓存恢复解析结果，无需再次 OCR 或调用模型。" });
+      setWorkspaceSummaries(await listWorkspaces());
+      setMobileTab("learn");
+      return;
+    }
+
+    const timestamp = Date.now();
+    const job: ProcessingJob = resumedJob
+      ? {
+          ...resumedJob,
+          fileBlob: file.slice(0, file.size, file.type),
+          status: "processing",
+          error: undefined,
+          message: resumedJob.ocrManifest ? "正在从已保存的 OCR 阶段继续。" : "正在重新开始未完成的浏览器分析。",
+          updatedAt: timestamp,
+        }
+      : {
+          version: 1,
+          id: createId(),
+          fingerprint,
+          fileName: file.name,
+          fileType: file.type,
+          fileSize: file.size,
+          fileBlob: file.slice(0, file.size, file.type),
+          ocrMode: selectedOcrMode,
+          phase: "hashing",
+          status: "processing",
+          progress: 5,
+          current: 1,
+          total: 1,
+          message: "文件指纹已计算，未发现可复用缓存。",
+          startedAt: timestamp,
+          updatedAt: timestamp,
+        };
+    processingJobRef.current = job;
+    setProcessingJob(job);
+    await saveProcessingJob(job);
+
+    const reportPhase = (
+      phase: UploadPhase,
+      current: number,
+      total: number | null,
+      message: string,
+      persist = true,
+    ) => {
+      const progress = pipelineProgress(phase, current, total);
+      setUploadPhase(phase);
+      setUploadProgress(progress);
+      setUploadDetail({ current, total, message });
+      void updateProcessingJob({ phase, status: "processing", progress, current, total, message, error: undefined }, persist);
+    };
+    const markFailed = (error: ApiError) => {
+      setUploadError(error);
+      setUploadPhase("error");
+      setRetryAvailable(true);
+      void updateProcessingJob({ status: "failed", error, message: error.message });
+    };
+
+    const formData = new FormData();
+    if (job.documentCheckpoint && job.checkpointStage) {
+      formData.append("documentCheckpoint", JSON.stringify(job.documentCheckpoint));
+      formData.append("checkpointStage", job.checkpointStage);
+    } else {
+      formData.append("file", file);
+    }
+    formData.append("ocrMode", selectedOcrMode);
+
+    let manifest: OcrManifest | undefined = resumedJob?.ocrManifest;
+    if (selectedOcrMode !== "none" && !manifest) {
       const controller = new AbortController();
       ocrControllerRef.current = controller;
-      setUploadPhase("preparing_ocr");
+      reportPhase("preparing_ocr", 0, null, "正在准备浏览器文字与视觉分析。", true);
       try {
-        const manifest = await runBrowserDocumentAnalysis(file, {
+        manifest = await runBrowserDocumentAnalysis(file, {
           signal: controller.signal,
-          mode: ocrMode,
+          mode: selectedOcrMode,
           onProgress: (progress) => {
             const phase: UploadPhase = progress.phase === "preparing"
               ? "preparing_ocr"
               : progress.phase === "rendering"
                 ? "rendering"
                 : "ocr";
-            const pageProgress = progress.total > 0
-              ? ((Math.max(0, progress.current - 1) + (progress.progress ?? 0)) / progress.total) * 100
-              : 0;
-            setUploadPhase(phase);
-            setUploadDetail({
-              current: progress.current,
-              total: progress.total || null,
-              message: progress.message,
-            });
-            setUploadProgress(Math.max(0, Math.min(100, Math.round(pageProgress))));
+            const current = Math.max(0, progress.current - (progress.progress == null ? 0 : 1)) + (progress.progress ?? 0);
+            reportPhase(phase, current, progress.total || null, progress.message, progress.progress == null || progress.progress >= 0.99);
           },
         });
-        formData.append("ocrManifest", JSON.stringify(manifest));
+        await updateProcessingJob({ ocrManifest: manifest, message: "OCR 与视觉候选已保存，后续失败无需重复识别。" });
       } catch (error) {
         if (controller.signal.aborted || (error instanceof DOMException && error.name === "AbortError")) {
-          setUploadPhase(documentIndex ? "ready" : "idle");
-          setUploadProgress(0);
-          setUploadDetail(null);
           return;
         }
-        setUploadError({
+        markFailed({
           code: "BROWSER_OCR_FAILED",
           message: error instanceof Error ? error.message : "浏览器文档分析失败，请关闭 OCR 或更换文件后重试。",
           details: { canRetry: true },
         });
-        setUploadPhase("error");
         return;
       } finally {
         if (ocrControllerRef.current === controller) ocrControllerRef.current = null;
       }
     }
+    if (manifest) formData.append("ocrManifest", JSON.stringify(manifest));
 
-    setUploadProgress(0);
-    setUploadDetail(null);
-    setUploadPhase("uploading");
+    reportPhase("uploading", 0, file.size, manifest ? "正在上传课件和已保存的分析结果。" : "正在上传课件。", true);
 
     const xhr = new XMLHttpRequest();
     let responseOffset = 0;
@@ -573,55 +776,73 @@ export default function Home() {
     xhr.open("POST", "/api/documents");
     xhr.setRequestHeader("Accept", "application/x-ndjson");
     xhr.upload.onprogress = (event) => {
-      if (event.lengthComputable) setUploadProgress(Math.round((event.loaded / event.total) * 100));
+      if (event.lengthComputable) reportPhase("uploading", event.loaded, event.total, `正在上传 ${Math.round((event.loaded / event.total) * 100)}%`, false);
     };
     xhr.upload.onload = () => {
-      setUploadProgress(100);
-      setUploadPhase("parsing");
-      setUploadProgress(0);
+      reportPhase("parsing", 0, null, "上传完成，正在解析课件结构。", true);
     };
     xhr.onerror = () => {
-      setUploadError({ code: "NETWORK_ERROR", message: "上传失败，请检查网络连接后重试。" });
-      setUploadPhase("error");
+      markFailed({ code: "NETWORK_ERROR", message: "上传失败，已保存 OCR 结果；恢复后不会重复识别。", details: { canRetry: true } });
       uploadRequestRef.current = null;
     };
     xhr.onabort = () => {
       uploadRequestRef.current = null;
     };
 
-    const applyStreamEvent = (event: {
-      type?: "progress" | "complete" | "error";
+    const applyStreamEvent = async (event: {
+      type?: "progress" | "checkpoint" | "complete" | "error";
       phase?: "parsing" | "indexing" | "embedding" | "vision";
+      stage?: "parsed" | "vision";
       current?: number;
       total?: number | null;
       message?: string;
       document?: DocumentIndex;
       error?: ApiError;
     }) => {
-      if (event.type === "progress" && event.phase) {
+      if (event.type === "checkpoint" && event.stage && event.document) {
+        await updateProcessingJob({
+          checkpointStage: event.stage,
+          documentCheckpoint: event.document,
+          message: event.stage === "parsed"
+            ? "课件结构已保存；后续失败可直接继续视觉分析。"
+            : "视觉分析结果已保存；后续失败可直接继续建立语义索引。",
+        });
+      } else if (event.type === "progress" && event.phase) {
         const phase: UploadPhase = event.phase === "parsing"
           ? "parsing"
           : event.phase === "vision" ? "vision" : "indexing";
         const current = Number(event.current ?? 0);
         const total = event.total == null ? null : Number(event.total);
-        setUploadPhase(phase);
-        setUploadDetail({ current, total, message: event.message ?? UPLOAD_COPY[phase].detail });
-        setUploadProgress(total && total > 0 ? Math.round((current / total) * 100) : 0);
+        reportPhase(phase, current, total, event.message ?? UPLOAD_COPY[phase].detail, true);
       } else if (event.type === "complete" && event.document) {
         receivedTerminalEvent = true;
         lastUploadFileRef.current = null;
-        setDocumentIndex(event.document);
-        setMessages([]);
-        setActiveSources([]);
-        setSelectedSourceId(null);
+        const completedAt = Date.now();
+        const newWorkspace: WorkspaceSnapshot = {
+          version: 2,
+          id: `workspace-${fingerprint.slice(0, 24)}`,
+          fingerprint,
+          documentIndex: event.document,
+          messages: [],
+          mode,
+          ocrMode: selectedOcrMode,
+          progress: DEFAULT_PROGRESS,
+          createdAt: completedAt,
+          savedAt: completedAt,
+        };
+        await cacheDocument({ fingerprint, documentIndex: event.document, ocrMode: selectedOcrMode, cachedAt: completedAt });
+        await saveWorkspace(newWorkspace);
+        await deleteProcessingJob(job.id);
+        processingJobRef.current = null;
+        setProcessingJob(null);
+        applyWorkspaceSnapshot(newWorkspace);
+        setWorkspaceSummaries(await listWorkspaces());
         setUploadDetail(null);
         setUploadProgress(100);
-        setUploadPhase("ready");
         setMobileTab("learn");
       } else if (event.type === "error") {
         receivedTerminalEvent = true;
-        setUploadError(event.error ?? { code: "UPLOAD_FAILED", message: "课件处理失败，请稍后重试。" });
-        setUploadPhase("error");
+        markFailed(event.error ?? { code: "UPLOAD_FAILED", message: "课件处理失败，请稍后重试。", details: { canRetry: true } });
       }
     };
 
@@ -635,16 +856,16 @@ export default function Home() {
       for (const line of lines) {
         if (!line.trim()) continue;
         try {
-          applyStreamEvent(JSON.parse(line));
+          void applyStreamEvent(JSON.parse(line));
         } catch {
-          if (final) setUploadError({ code: "INVALID_RESPONSE", message: "服务器返回了无法识别的处理结果。" });
+          if (final) markFailed({ code: "INVALID_RESPONSE", message: "服务器返回了无法识别的处理结果。", details: { canRetry: true } });
         }
       }
       if (final && remainder.trim()) {
         try {
-          applyStreamEvent(JSON.parse(remainder));
+          void applyStreamEvent(JSON.parse(remainder));
         } catch {
-          setUploadError({ code: "INVALID_RESPONSE", message: "服务器返回了无法识别的处理结果。" });
+          markFailed({ code: "INVALID_RESPONSE", message: "服务器返回了无法识别的处理结果。", details: { canRetry: true } });
         }
       }
     };
@@ -655,17 +876,15 @@ export default function Home() {
       if (xhr.status < 200 || xhr.status >= 300) {
         try {
           const response = JSON.parse(xhr.responseText) as { error?: ApiError };
-          setUploadError(response.error ?? { code: "UPLOAD_FAILED", message: "课件处理失败，请稍后重试。" });
+          markFailed(response.error ?? { code: "UPLOAD_FAILED", message: "课件处理失败，请稍后重试。", details: { canRetry: true } });
         } catch {
-          setUploadError({ code: "UPLOAD_FAILED", message: "课件处理失败，请稍后重试。" });
+          markFailed({ code: "UPLOAD_FAILED", message: "课件处理失败，请稍后重试。", details: { canRetry: true } });
         }
-        setUploadPhase("error");
         return;
       }
       consumeResponse(true);
       if (!receivedTerminalEvent) {
-        setUploadError({ code: "INCOMPLETE_RESPONSE", message: "课件处理未完成，请重试。" });
-        setUploadPhase("error");
+        markFailed({ code: "INCOMPLETE_RESPONSE", message: "课件处理未完成，已保存中间结果，可继续重试。", details: { canRetry: true } });
       }
     };
     xhr.send(formData);
@@ -689,6 +908,11 @@ export default function Home() {
       mode,
     };
     setMessages((current) => [...current, userMessage]);
+    setStudyProgress((current) => ({
+      ...current,
+      mastery: current.mastery === "not_started" ? "learning" : current.mastery,
+      lastStudiedAt: Date.now(),
+    }));
     setInput("");
     setRequestError(null);
     setLoading(true);
@@ -777,17 +1001,39 @@ export default function Home() {
     setRequestError(null);
   };
 
-  const removeDocument = () => {
+  const switchWorkspace = async (id: string) => {
+    if (id === workspaceId || uploadBusy) return;
+    const snapshot = await loadWorkspace(id);
+    if (!snapshot || snapshot.documentIndex.indexVersion !== CURRENT_DOCUMENT_INDEX_VERSION) return;
+    await setActiveWorkspaceId(id);
+    applyWorkspaceSnapshot(snapshot);
+    setUploadError(null);
+    setRequestError(null);
+    setMobileTab("learn");
+  };
+
+  const removeDocument = async () => {
     if (messages.length > 0 && !window.confirm("移除课件会同时清空当前学习记录，确定继续吗？")) return;
+    if (workspaceId) await clearWorkspace(workspaceId);
+    const remaining = await listWorkspaces();
+    setWorkspaceSummaries(remaining);
+    if (remaining[0]) {
+      const next = await loadWorkspace(remaining[0].id);
+      if (next) applyWorkspaceSnapshot(next);
+      return;
+    }
+    setWorkspaceId(null);
+    setWorkspaceFingerprint(null);
     setDocumentIndex(null);
     setMessages([]);
+    setStudyProgress(DEFAULT_PROGRESS);
     setActiveSources([]);
     setSelectedSourceId(null);
     setUploadError(null);
-    setUploadPhase("idle");
-    setRetryAvailable(false);
+    setUploadPhase(processingJob ? "paused" : "idle");
+    setRetryAvailable(Boolean(processingJob));
     setMobileTab("files");
-    void clearWorkspace();
+    await setActiveWorkspaceId(null);
   };
 
   const handleFeedback = (messageId: string, feedback: "helpful" | "inaccurate") => {
@@ -842,13 +1088,36 @@ export default function Home() {
         <div className="flex-1 space-y-6 overflow-y-auto p-4">
           <section>
             <div className="mb-2 flex items-center justify-between">
-              <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-400">课件文件</h2>
+              <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-400">课件工作区</h2>
               {documentIndex && (
-                <button type="button" onClick={removeDocument} className="text-xs text-slate-400 hover:text-red-600">
+                <button type="button" onClick={() => void removeDocument()} className="text-xs text-slate-400 hover:text-red-600">
                   移除
                 </button>
               )}
             </div>
+
+            {workspaceSummaries.length > 0 && (
+              <div className="mb-3 space-y-1.5">
+                {workspaceSummaries.map((workspace) => (
+                  <button
+                    key={workspace.id}
+                    type="button"
+                    disabled={uploadBusy}
+                    onClick={() => void switchWorkspace(workspace.id)}
+                    className={`w-full rounded-xl border px-3 py-2.5 text-left transition ${
+                      workspace.id === workspaceId
+                        ? "border-blue-300 bg-blue-50"
+                        : "border-slate-200 bg-white hover:border-slate-300"
+                    } disabled:cursor-not-allowed disabled:opacity-60`}
+                  >
+                    <p className="truncate text-xs font-semibold text-slate-800" title={workspace.name}>{workspace.name}</p>
+                    <p className="mt-1 text-[10px] text-slate-500">
+                      {MASTERY_COPY[workspace.mastery]} · {workspace.messageCount} 条对话
+                    </p>
+                  </button>
+                ))}
+              </div>
+            )}
 
             <fieldset className="mb-3" disabled={uploadBusy}>
               <legend className="sr-only">OCR 处理模式</legend>
@@ -918,18 +1187,21 @@ export default function Home() {
                 <div className="min-w-0">
                   <p className="text-sm font-semibold text-slate-800">{UPLOAD_COPY[uploadPhase].title}</p>
                   <p className="mt-1 text-xs leading-5 text-slate-500">{uploadError?.message ?? uploadDetail?.message ?? UPLOAD_COPY[uploadPhase].detail}</p>
+                  {uploadBusy && formatDuration(estimatedRemaining) && (
+                    <p className="mt-1 text-[11px] font-medium text-blue-600">{formatDuration(estimatedRemaining)}</p>
+                  )}
                 </div>
               </div>
               {uploadBusy && (
                 <div className="mt-4">
                   <div className="h-1.5 overflow-hidden rounded-full bg-slate-200">
                     <div
-                      className={`h-full rounded-full bg-blue-600 transition-all ${uploadPhase !== "uploading" && !uploadDetail?.total ? "animate-pulse" : ""}`}
-                      style={{ width: `${uploadPhase === "uploading" || uploadDetail?.total ? uploadProgress : 100}%` }}
+                      className="h-full rounded-full bg-blue-600 transition-all"
+                      style={{ width: `${Math.max(2, uploadProgress)}%` }}
                     />
                   </div>
                   <button type="button" onClick={(event) => { event.preventDefault(); cancelUpload(); }} className="mt-3 text-xs font-medium text-slate-500 hover:text-red-600">
-                    取消处理
+                    暂停处理
                   </button>
                 </div>
               )}
@@ -939,12 +1211,39 @@ export default function Home() {
                   onClick={(event) => {
                     event.preventDefault();
                     event.stopPropagation();
-                    if (lastUploadFileRef.current) void processDocument(lastUploadFileRef.current);
+                    if (processingJob) void processDocument(fileFromProcessingJob(processingJob), processingJob);
+                    else if (lastUploadFileRef.current) void processDocument(lastUploadFileRef.current);
                   }}
                   className="mt-3 inline-flex items-center gap-1.5 rounded-lg bg-white px-2.5 py-1.5 text-xs font-semibold text-red-700 shadow-sm hover:bg-red-100"
                 >
-                  <RefreshCcw size={13} /> 重试上次文件
+                  <RefreshCcw size={13} /> 从失败阶段重试
                 </button>
+              )}
+              {uploadPhase === "paused" && processingJob && (
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      void processDocument(fileFromProcessingJob(processingJob), processingJob);
+                    }}
+                    className="inline-flex items-center gap-1.5 rounded-lg bg-white px-2.5 py-1.5 text-xs font-semibold text-blue-700 shadow-sm hover:bg-blue-100"
+                  >
+                    <RefreshCcw size={13} /> 继续未完成任务
+                  </button>
+                  <button
+                    type="button"
+                    onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      void discardProcessingJob();
+                    }}
+                    className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-slate-500 hover:bg-red-50 hover:text-red-700"
+                  >
+                    <Trash2 size={13} /> 删除此任务
+                  </button>
+                </div>
               )}
             </label>
 
@@ -961,17 +1260,41 @@ export default function Home() {
                       {documentIndex.retrievalMode === "hybrid" ? "语义＋关键词混合索引" : "关键词索引（语义服务已降级）"}
                     </p>
                     {documentIndex.ocr && documentIndex.ocr.mode !== "none" && (
-                      <p className="mt-1 text-[11px] text-emerald-700/80">
-                        {documentIndex.ocr.mode === "auto" ? "自动 OCR" : "全页 OCR"} · 成功 {documentIndex.ocr.successfulPageCount}/{documentIndex.ocr.automaticallySelectedPageCount ?? documentIndex.ocr.totalPageCount} 个选定页面
-                        {documentIndex.ocr.averageConfidence != null ? ` · 平均置信度 ${documentIndex.ocr.averageConfidence}%` : ""}
-                      </p>
+                      <>
+                        <p className="mt-1 text-[11px] text-emerald-700/80">
+                          {documentIndex.ocr.mode === "auto" ? "自动 OCR" : "全页 OCR"} · 成功 {documentIndex.ocr.successfulPageCount}/{documentIndex.ocr.automaticallySelectedPageCount ?? documentIndex.ocr.totalPageCount} 个选定页面
+                          {documentIndex.ocr.averageConfidence != null ? ` · 平均置信度 ${documentIndex.ocr.averageConfidence}%` : ""}
+                        </p>
+                        {!!documentIndex.ocr.failedPageNumbers?.length && (
+                          <p className="mt-1 text-[11px] text-amber-700">OCR 失败页：{documentIndex.ocr.failedPageNumbers.join("、")}</p>
+                        )}
+                      </>
                     )}
                     {(documentIndex.vision?.analyzedCount ?? 0) > 0 && (
                       <p className="mt-1 text-[11px] text-emerald-700/80">
                         图片证据 · 已分析 {documentIndex.vision?.analyzedCount}/{documentIndex.vision?.candidateCount} 个候选区域
                       </p>
                     )}
+                    {!!documentIndex.vision?.failedLocations?.length && (
+                      <p className="mt-1 text-[11px] text-amber-700">
+                        视觉分析失败位置：{documentIndex.vision.failedLocations.map((item) => item.number).join("、")}（文字问答仍可使用）
+                      </p>
+                    )}
                     {documentIndex.truncated && <p className="mt-2 text-xs text-amber-700">课件较长，已在安全上限内建立索引。</p>}
+                    <label className="mt-3 block text-[11px] font-medium text-emerald-800">
+                      掌握程度
+                      <select
+                        value={studyProgress.mastery}
+                        onChange={(event) => setStudyProgress((current) => ({
+                          ...current,
+                          mastery: event.target.value as MasteryStatus,
+                          lastStudiedAt: Date.now(),
+                        }))}
+                        className="mt-1 w-full rounded-lg border border-emerald-200 bg-white px-2 py-1.5 text-xs text-emerald-900 outline-none focus:border-emerald-400"
+                      >
+                        {Object.entries(MASTERY_COPY).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                      </select>
+                    </label>
                   </div>
                 </div>
               </div>

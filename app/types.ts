@@ -1,8 +1,10 @@
 export type LearningMode = "tutor" | "explain" | "qa" | "quiz" | "review";
 export type OcrMode = "auto" | "none" | "force";
+export type MasteryStatus = "not_started" | "learning" | "mastered" | "review_needed";
 
 export type UploadPhase =
   | "idle"
+  | "hashing"
   | "preparing_ocr"
   | "rendering"
   | "ocr"
@@ -10,8 +12,16 @@ export type UploadPhase =
   | "parsing"
   | "indexing"
   | "vision"
+  | "paused"
   | "ready"
   | "error";
+
+export interface StudyProgress {
+  mastery: MasteryStatus;
+  completedChunkIds: string[];
+  lastPosition?: { kind: "page" | "slide" | "section"; number: number };
+  lastStudiedAt?: number;
+}
 
 export interface DocumentChunk {
   id: string;
@@ -50,12 +60,14 @@ export interface OcrSummary {
   durationMs?: number;
   inspectedPageCount?: number;
   automaticallySelectedPageCount?: number;
+  failedPageNumbers?: number[];
 }
 
 export interface VisionSummary {
   candidateCount: number;
   analyzedCount: number;
   failedCount: number;
+  failedLocations?: Array<{ kind: "page" | "slide"; number: number }>;
   model?: string;
 }
 
