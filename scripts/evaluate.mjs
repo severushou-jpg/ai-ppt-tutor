@@ -145,8 +145,9 @@ const report = {
   },
 };
 const reportsDirectory = path.join(root, "evaluation", "reports");
+const reportPath = path.join(reportsDirectory, online ? "latest.json" : "offline-latest.json");
 await mkdir(reportsDirectory, { recursive: true });
-await writeFile(path.join(reportsDirectory, "latest.json"), `${JSON.stringify(report, null, 2)}\n`);
+await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
 console.log(JSON.stringify({
   dataset: report.dataset,
   mode: report.mode,
@@ -154,6 +155,6 @@ console.log(JSON.stringify({
   ocr: report.ocr,
   refusal: report.refusal,
   gates: report.gates,
-  reportPath: path.join(reportsDirectory, "latest.json"),
+  reportPath,
 }, null, 2));
 if (Object.values(report.gates).some((passed) => !passed)) process.exitCode = 1;

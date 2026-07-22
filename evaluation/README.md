@@ -2,7 +2,7 @@
 
 评测权重按照当前产品优先级固定为：整课概览 30%、知识点详解 25%、代码/表格/图表 20%、复习总结 15%、概念比较 10%。
 
-`npm run eval` 会运行离线检索基线；`node --env-file=.env.local scripts/evaluate.mjs evaluation/datasets/real-lectures-v1.json --online` 会加入真实 Embedding 和 Reranker。两者都会输出 `evaluation/reports/latest.json`。每题至少填写 `category`、`question`、`mode` 和 `relevantChunkIds`；无法从课件回答的问题还需标注 `shouldRefuse: true`。
+`npm run eval` 会运行离线检索基线并输出不入库的 `evaluation/reports/offline-latest.json`；`node --env-file=.env.local scripts/evaluate.mjs evaluation/datasets/real-lectures-v1.json --online` 会加入真实 Embedding 和 Reranker，并更新 `evaluation/reports/latest.json`。每题至少填写 `category`、`question`、`mode` 和 `relevantChunkIds`；无法从课件回答的问题还需标注 `shouldRefuse: true`。
 
 10 份课件的候选集可用下面的命令重新生成：
 
