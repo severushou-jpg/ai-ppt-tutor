@@ -27,8 +27,7 @@ export async function renderPdfPages(
   consume: PageConsumer,
 ) {
   const pdfjs = await import("pdfjs-dist");
-  pdfjs.GlobalWorkerOptions.workerSrc =
-    "https://cdn.jsdelivr.net/npm/pdfjs-dist@5.6.205/build/pdf.worker.min.mjs";
+  pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
   const loadingTask = pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) });
   const abortLoading = () => loadingTask.destroy();
   signal.addEventListener("abort", abortLoading, { once: true });
@@ -40,6 +39,11 @@ export async function renderPdfPages(
       const number = index + 1;
       emitRenderingProgress(onProgress, number, pdf.numPages, "页面");
       const page = await pdf.getPage(number);
+      const textContent = await page.getTextContent();
+      const nativeTextLength = textContent.items.reduce(
+        (sum, item) => sum + ("str" in item ? String(item.str).trim().length : 0),
+        0,
+      );
       const baseViewport = page.getViewport({ scale: 1 });
       const maximumPixels = 8_000_000;
       const preferredScale = 2;
@@ -60,6 +64,7 @@ export async function renderPdfPages(
         await consume({
           number,
           canvas,
+          nativeTextLength,
           release: () => {
             canvas.width = 1;
             canvas.height = 1;
@@ -128,6 +133,7 @@ export async function renderPptxSlides(
         await handle.ready;
         await document.fonts?.ready;
         throwIfAborted(signal);
+        const nativeTextLength = (handle.element.textContent ?? "").replace(/\s+/g, " ").trim().length;
         const canvas = await html2canvas(handle.element, {
           backgroundColor: "#ffffff",
           logging: false,
@@ -140,6 +146,7 @@ export async function renderPptxSlides(
           await consume({
             number,
             canvas,
+            nativeTextLength,
             release: () => {
               canvas.width = 1;
               canvas.height = 1;

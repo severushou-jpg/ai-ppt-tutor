@@ -12,6 +12,7 @@
 
 # testing
 /coverage
+/evaluation/reports/offline-latest.json
 
 # next.js
 /.next/
@@ -19,6 +20,7 @@
 
 # production
 /build
+/public/pdf.worker.min.mjs
 
 # misc
 .DS_Store

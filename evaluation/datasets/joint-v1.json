@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "name": "OCR/RAG/图表联合评测集 v1",
+  "priorities": {
+    "overview": 0.30,
+    "detail": 0.25,
+    "visual": 0.20,
+    "review": 0.15,
+    "comparison": 0.10
+  },
+  "documents": [
+    {
+      "id": "joint-fixture",
+      "status": "synthetic-baseline",
+      "chunks": [
+        { "id": "p1", "fileName": "fixture.pdf", "kind": "page", "number": 1, "label": "第 1 页", "title": "Threads overview", "contentType": "list", "textOrigin": "native", "text": "课程知识结构包括线程基础、线程控制块、线程模型、用户级与内核级线程比较，以及调度与并发实践。" },
+        { "id": "p2", "fileName": "fixture.pdf", "kind": "page", "number": 2, "label": "第 2 页", "title": "Thread Control Block", "contentType": "definition", "textOrigin": "ocr", "ocrConfidence": 82, "text": "线程控制块 TCB 保存线程标识、程序计数器、寄存器状态、栈指针和调度信息。" },
+        { "id": "p3-visual", "fileName": "fixture.pdf", "kind": "page", "number": 3, "label": "第 3 页", "title": "Thread performance chart", "contentType": "visual", "textOrigin": "vision", "evidenceWeight": 0.92, "text": "视觉证据类型：chart\n摘要：柱状图比较不同线程数量下的执行时间。\n可见关系：线程数从 1 增加到 4 时执行时间下降，8 个线程后改善趋缓。" },
+        { "id": "p4", "fileName": "fixture.pdf", "kind": "page", "number": 4, "label": "第 4 页", "title": "User and kernel threads", "contentType": "table", "textOrigin": "native", "text": "用户级线程由用户空间线程库管理，切换开销较低；内核级线程由操作系统内核调度，阻塞隔离与多核并行能力更强。" },
+        { "id": "p5", "fileName": "fixture.pdf", "kind": "page", "number": 5, "label": "第 5 页", "title": "Review", "contentType": "list", "textOrigin": "native", "text": "复习顺序：先掌握线程与进程的区别，再理解 TCB 与线程模型，最后比较实现方式并联系性能图表。" }
+      ]
+    }
+  ],
+  "cases": [
+    { "id": "overview-01", "documentId": "joint-fixture", "category": "overview", "mode": "explain", "question": "请概览整份课件的知识结构。", "relevantChunkIds": ["p1", "p2", "p3-visual", "p4", "p5"] },
+    { "id": "detail-01", "documentId": "joint-fixture", "category": "detail", "mode": "qa", "question": "线程控制块 TCB 具体保存哪些信息？", "relevantChunkIds": ["p2"] },
+    { "id": "visual-01", "documentId": "joint-fixture", "category": "visual", "mode": "qa", "question": "图表中线程数量与执行时间有什么趋势？", "relevantChunkIds": ["p3-visual"] },
+    { "id": "review-01", "documentId": "joint-fixture", "category": "review", "mode": "review", "question": "生成一份复习总结并安排复习顺序。", "relevantChunkIds": ["p1", "p2", "p3-visual", "p4", "p5"] },
+    { "id": "comparison-01", "documentId": "joint-fixture", "category": "comparison", "mode": "qa", "question": "比较用户级线程和内核级线程。", "relevantChunkIds": ["p4"] }
+  ],
+  "ocrSamples": [
+    { "id": "ocr-01", "expected": "线程控制块保存程序计数器和寄存器状态", "actual": "线程控制块保存程序计数器和寄存器状态" }
+  ]
+}

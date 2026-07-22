@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  buildRetrievalQueries,
   buildDocumentIndex,
   buildGroundingContext,
   createSources,
+  evidenceReliability,
   extractSections,
   isDocumentWideQuestion,
   retrieveChunks,
@@ -148,4 +150,18 @@ test("sources include a query-focused sentence highlight", () => {
   const sources = createSources(results, "聚类算法");
   assert.match(sources[0].highlight, /聚类/);
   assert(sources[0].excerpt.includes(sources[0].highlight));
+});
+
+test("OCR confidence and vision reliability affect evidence weight", () => {
+  assert.equal(evidenceReliability({ textOrigin: "native" }), 1);
+  assert.ok(evidenceReliability({ textOrigin: "ocr", ocrConfidence: 20 }) <
+    evidenceReliability({ textOrigin: "ocr", ocrConfidence: 90 }));
+  assert.equal(evidenceReliability({ textOrigin: "vision", evidenceWeight: 0.88 }), 0.88);
+});
+
+test("multi-query expansion adds visual and comparison vocabulary", () => {
+  const queries = buildRetrievalQueries("对比图表中的性能趋势");
+  assert.ok(queries.length >= 3);
+  assert.ok(queries.some((query) => /chart/.test(query)));
+  assert.ok(queries.some((query) => /versus/.test(query)));
 });

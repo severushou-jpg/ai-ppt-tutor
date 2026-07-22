@@ -11,6 +11,40 @@ test("none mode does not require an OCR manifest", () => {
   assert.equal(parseOcrManifest(null, "none"), null);
 });
 
+test("auto mode accepts selective OCR and validated visual crops", () => {
+  const manifest = parseOcrManifest({
+    version: 2,
+    mode: "auto",
+    sourceType: "pdf",
+    inspectedPageCount: 12,
+    pages: [],
+    visuals: [{
+      id: "page-4-visual",
+      number: 4,
+      kind: "page",
+      imageDataUrl: "data:image/jpeg;base64,YWJj",
+      crop: { x: 10, y: 20, width: 300, height: 200 },
+      score: 0.8,
+    }],
+  }, "auto");
+  assert.equal(manifest.inspectedPageCount, 12);
+  assert.equal(manifest.visuals[0].number, 4);
+});
+
+test("auto mode does not merge very low confidence OCR noise", () => {
+  const ast = { content: [{ type: "page", metadata: { pageNumber: 1 }, text: "可靠原生文字" }] };
+  const manifest = parseOcrManifest({
+    mode: "auto",
+    sourceType: "pdf",
+    inspectedPageCount: 1,
+    pages: [{ number: 1, text: "l1I 噪声", confidence: 20, durationMs: 10 }],
+    visuals: [],
+  }, "auto");
+  const result = applyOcrManifest(ast, manifest);
+  assert.equal(result.ast.content[0].text, "可靠原生文字");
+  assert.equal(result.ast.content[0].metadata.ocrConfidence, 20);
+});
+
 test("force mode validates and normalizes page results", () => {
   const manifest = parseOcrManifest(JSON.stringify({
     mode: "force",

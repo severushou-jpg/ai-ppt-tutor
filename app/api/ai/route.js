@@ -1,12 +1,14 @@
 import { NextResponse } from "next/server";
 import {
   buildGroundingContext,
+  buildRetrievalQueries,
   createSources,
   DOCUMENT_INDEX_VERSION,
   expandWithAdjacentChunks,
   isDocumentWideQuestion,
   normalizeWhitespace,
   retrieveChunks,
+  selectDiverseEvidence,
   selectDocumentCoverage,
 } from "@/lib/rag.js";
 import { embedTexts, rerankChunks } from "@/lib/dashscope-retrieval.js";
@@ -19,14 +21,15 @@ import {
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-const VALID_MODES = new Set(["explain", "qa", "quiz", "review"]);
-const VALID_CONTENT_TYPES = new Set(["prose", "heading", "definition", "list", "table", "code"]);
+const VALID_MODES = new Set(["tutor", "explain", "qa", "quiz", "review"]);
+const VALID_CONTENT_TYPES = new Set(["prose", "heading", "definition", "list", "table", "code", "visual"]);
 const MAX_QUESTION_LENGTH = 2_000;
 const MAX_HISTORY_ITEMS = 10;
 const MAX_HISTORY_CONTENT = 4_000;
-const MAX_REQUEST_BYTES = 4_000_000;
+const MAX_REQUEST_BYTES = 8_000_000;
 
 const MODE_INSTRUCTIONS = {
+  tutor: `你不是一次性回答器，而是负责让学生真正掌握内容的导师。根据对话历史判断当前阶段，并按“诊断先修知识 → 建立直觉 → 分步讲解 → 示范例题 → 引导练习 → 掌握检查 → 下一步”推进。一次只推进必要的阶段，不要把所有材料倾倒给学生。必须包含一个让学生主动回答的检查问题；不要立刻泄露该检查题答案。`,
   explain: `把内容组织为学习目标、核心讲解、例子、易错点和自检问题。根据学生问题控制深度；不要为了套模板重复内容。`,
   qa: `先直接回答，再给依据。问题包含多个子问题时逐项判断：有证据的项正常回答，没有证据的项将 supported 设为 false，并在 partialRefusal 说明。`,
   quiz: `生成 5 道由基础到应用的题目。题目放在 quiz.question，答案和解析分别放在 quiz.answer 与 quiz.explanation，不要在题目中泄露答案。每道解析必须绑定来源。`,
@@ -76,7 +79,7 @@ function safeEmbedding(value) {
 function parseDocument(value) {
   if (!value || typeof value !== "object" || !Array.isArray(value.chunks)) return null;
   const chunks = value.chunks
-    .slice(0, 180)
+    .slice(0, 240)
     .filter((chunk) => chunk && typeof chunk.id === "string" && typeof chunk.text === "string" && typeof chunk.label === "string")
     .map((chunk) => ({
       id: chunk.id.slice(0, 120),
@@ -88,8 +91,21 @@ function parseDocument(value) {
       contentType: VALID_CONTENT_TYPES.has(chunk.contentType) ? chunk.contentType : "prose",
       text: normalizeWhitespace(chunk.text).slice(0, 1_500),
       embedding: safeEmbedding(chunk.embedding),
-      textOrigin: ["native", "ocr", "mixed"].includes(chunk.textOrigin) ? chunk.textOrigin : "native",
+      textOrigin: ["native", "ocr", "mixed", "vision"].includes(chunk.textOrigin) ? chunk.textOrigin : "native",
       ocrConfidence: Number.isFinite(Number(chunk.ocrConfidence)) ? Number(chunk.ocrConfidence) : undefined,
+      evidenceWeight: Number.isFinite(Number(chunk.evidenceWeight)) ? Number(chunk.evidenceWeight) : undefined,
+      visual: chunk.visual && /^data:image\/(?:jpeg|png|webp);base64,/i.test(chunk.visual.imageDataUrl ?? "")
+        ? {
+          id: String(chunk.visual.id ?? chunk.id).slice(0, 100),
+          kind: ["chart", "table", "diagram", "code", "image", "unknown"].includes(chunk.visual.kind)
+            ? chunk.visual.kind : "unknown",
+          imageDataUrl: String(chunk.visual.imageDataUrl).slice(0, 450_000),
+          crop: chunk.visual.crop,
+          confidence: Math.max(0, Math.min(1, Number(chunk.visual.confidence) || 0)),
+          model: String(chunk.visual.model ?? "").slice(0, 80),
+          altText: String(chunk.visual.altText ?? "").slice(0, 1_000),
+        }
+        : undefined,
     }))
     .filter((chunk) => chunk.text.length >= 12);
   if (chunks.length === 0) return null;
@@ -130,6 +146,7 @@ function buildSystemMessage(mode, groundingContext, sources, options = {}) {
 5. 部分有依据时回答有依据的部分，并把缺失范围写入 partialRefusal；全部无依据时也不得编造。
 6. summary 只写一句任务导向概述，不在其中新增事实。
 7. 使用中文。回答长度与问题难度匹配：简单问答简洁，讲解和复习可以更详细。
+8. OCR 或视觉模型证据的可靠度低于原生文字；引用低置信度证据时明确说明不确定性。视觉证据只能支持其中明确描述的可见元素和关系。
 
 任务要求：${options.documentWide
     ? documentWideTaskInstruction(options.question ?? "", mode)
@@ -264,7 +281,7 @@ async function retrieveEvidence(parsed, apiKey, signal) {
     question: parsed.question,
     chunks: parsed.document.chunks,
     mode: parsed.mode,
-    topK: 12,
+    topK: 40,
     queryEmbedding,
   });
   if (candidates.length === 0) return {
@@ -277,7 +294,7 @@ async function retrieveEvidence(parsed, apiKey, signal) {
   if (apiKey) {
     try {
       ranked = await rerankChunks(parsed.question, candidates, apiKey, {
-        topK: Math.min(8, candidates.length),
+        topK: Math.min(12, candidates.length),
         signal,
       });
       rerankUsed = true;
@@ -294,7 +311,8 @@ async function retrieveEvidence(parsed, apiKey, signal) {
     indexedPageCount, selectedPageCount: 0,
   };
 
-  const chunks = expandWithAdjacentChunks(ranked.slice(0, 5), parsed.document.chunks, 6);
+  const diverse = selectDiverseEvidence(ranked, 8);
+  const chunks = expandWithAdjacentChunks(diverse, parsed.document.chunks, 10);
   return {
     chunks,
     embeddingUsed,
@@ -321,9 +339,13 @@ export async function POST(request) {
       mode: evidence.embeddingUsed ? "hybrid" : "lexical",
       reranked: evidence.rerankUsed,
       candidateCount: evidence.chunks.length,
-      strategy: evidence.documentWide ? "document_coverage" : "focused",
+      strategy: evidence.documentWide
+        ? "document_coverage"
+        : buildRetrievalQueries(parsed.question).length > 1 ? "multi_query" : "focused",
       indexedPageCount: evidence.indexedPageCount,
       selectedPageCount: evidence.selectedPageCount,
+      queryCount: buildRetrievalQueries(parsed.question).length,
+      visualCandidateCount: evidence.chunks.filter((chunk) => chunk.contentType === "visual").length,
     };
 
     if (parsed.mode === "qa" && evidence.chunks.length === 0) {
