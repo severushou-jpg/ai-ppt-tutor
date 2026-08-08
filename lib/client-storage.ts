@@ -35,6 +35,8 @@ export interface WorkspaceSummary {
   id: string;
   fingerprint: string;
   name: string;
+  indexVersion: number;
+  ocrMode: OcrMode;
   mastery: StudyProgress["mastery"];
   messageCount: number;
   savedAt: number;
@@ -67,6 +69,8 @@ export interface ProcessingJob {
   ocrManifest?: OcrManifest;
   checkpointStage?: "parsed" | "vision";
   documentCheckpoint?: DocumentIndex;
+  documentCheckpointPayload?: string;
+  checkpointSignature?: string;
   error?: ApiError;
 }
 
@@ -202,6 +206,8 @@ export async function listWorkspaces(): Promise<WorkspaceSummary[]> {
         id: workspace.id,
         fingerprint: workspace.fingerprint,
         name: workspace.documentIndex.name,
+        indexVersion: workspace.documentIndex.indexVersion,
+        ocrMode: workspace.ocrMode,
         mastery: workspace.progress.mastery,
         messageCount: workspace.messages.length,
         savedAt: workspace.savedAt,
@@ -225,10 +231,31 @@ export async function clearWorkspace(id?: string | null): Promise<void> {
   if (!workspaceId) return;
   const activeWorkspaceId = await getActiveWorkspaceId();
   await withDatabase(async (database) => {
-    const transaction = database.transaction([WORKSPACES_STORE, META_STORE], "readwrite");
+    const transaction = database.transaction(
+      [WORKSPACES_STORE, DOCUMENTS_STORE, JOBS_STORE, META_STORE],
+      "readwrite",
+    );
     const completed = transactionComplete(transaction);
-    transaction.objectStore(WORKSPACES_STORE).delete(workspaceId);
+    const workspaceStore = transaction.objectStore(WORKSPACES_STORE);
+    const workspaceRequest = workspaceStore.get(workspaceId);
+    const workspacesRequest = workspaceStore.getAll();
+    const jobsRequest = transaction.objectStore(JOBS_STORE).getAll();
+    const [workspace, workspaces, jobs] = await Promise.all([
+      requestResult(workspaceRequest) as Promise<WorkspaceSnapshot | undefined>,
+      requestResult(workspacesRequest) as Promise<WorkspaceSnapshot[]>,
+      requestResult(jobsRequest) as Promise<ProcessingJob[]>,
+    ]);
+    workspaceStore.delete(workspaceId);
     if (activeWorkspaceId === workspaceId) transaction.objectStore(META_STORE).delete(ACTIVE_WORKSPACE_KEY);
+    if (
+      workspace?.fingerprint &&
+      !workspaces.some((candidate) => candidate.id !== workspaceId && candidate.fingerprint === workspace.fingerprint)
+    ) {
+      transaction.objectStore(DOCUMENTS_STORE).delete(workspace.fingerprint);
+      for (const job of jobs) {
+        if (job.fingerprint === workspace.fingerprint) transaction.objectStore(JOBS_STORE).delete(job.id);
+      }
+    }
     await completed;
   });
 }

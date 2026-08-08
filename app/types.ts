@@ -1,6 +1,45 @@
 export type LearningMode = "tutor" | "explain" | "qa" | "quiz" | "review";
 export type OcrMode = "auto" | "none" | "force";
 export type MasteryStatus = "not_started" | "learning" | "mastered" | "review_needed";
+export type ExperimentCondition = "full_evidence" | "baseline";
+
+export interface ExperimentSessionMetadata {
+  participantId: string;
+  sessionId: string;
+  condition: ExperimentCondition;
+  materialVersion: string;
+  startedAt: number;
+}
+
+export interface GenerationVersionMetadata {
+  promptVersion: string;
+  modelVersion: string;
+  materialVersion: string;
+  condition: ExperimentCondition;
+}
+
+export type ExperimentEventName =
+  | "session_start"
+  | "condition_changed"
+  | "upload_success"
+  | "answer_generated"
+  | "citation_shown"
+  | "source_click"
+  | "citation_view"
+  | "learning_time"
+  | "quiz_answer"
+  | "session_end";
+
+export interface ExperimentEvent {
+  eventId: string;
+  event: ExperimentEventName;
+  timestamp: number;
+  participantId: string;
+  sessionId: string;
+  condition: ExperimentCondition;
+  materialVersion: string;
+  data: Record<string, string | number | boolean | null>;
+}
 
 export type UploadPhase =
   | "idle"
@@ -98,6 +137,10 @@ export interface CitationSource {
   number: number;
   excerpt: string;
   highlight?: string;
+  originalText: string;
+  highlightedEvidence?: string;
+  confidenceScore: number;
+  reason: string;
   title?: string;
   contentType?: DocumentChunk["contentType"];
   textOrigin?: DocumentChunk["textOrigin"];
@@ -129,10 +172,10 @@ export interface StructuredAnswer {
 }
 
 export interface RetrievalMetadata {
-  mode: "lexical" | "hybrid";
+  mode: "none" | "lexical" | "hybrid";
   reranked: boolean;
   candidateCount: number;
-  strategy?: "focused" | "document_coverage" | "multi_query";
+  strategy?: "ungrounded" | "focused" | "document_coverage" | "multi_query";
   indexedPageCount?: number;
   selectedPageCount?: number;
   queryCount?: number;
@@ -150,6 +193,8 @@ export interface ChatMessage {
   structured?: StructuredAnswer;
   retrieval?: RetrievalMetadata;
   feedback?: "helpful" | "inaccurate";
+  generatedAt?: number;
+  versionMetadata?: GenerationVersionMetadata;
 }
 
 export interface ApiError {

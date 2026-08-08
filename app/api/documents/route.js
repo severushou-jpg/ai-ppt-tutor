@@ -1,36 +1,45 @@
 import { NextResponse } from "next/server";
 import {
   DocumentProcessingError,
-  parseDocument,
+  parseClientDocument,
 } from "@/lib/document-parser.js";
-import { DOCUMENT_LIMITS } from "@/lib/rag.js";
 import {
   EMBEDDING_DIMENSIONS,
   EMBEDDING_MODEL,
   embedDocumentChunks,
 } from "@/lib/dashscope-retrieval.js";
-import { OCR_LIMITS, parseOcrManifest } from "@/lib/ocr.js";
+import { parseOcrManifest } from "@/lib/ocr.js";
 import { analyzeVisualCandidates } from "@/lib/visual-analysis.js";
 import {
-  DOCUMENT_CHECKPOINT_MAX_BYTES,
   parseDocumentCheckpoint,
+  signDocumentCheckpoint,
 } from "@/lib/document-checkpoint.js";
+import {
+  checkRequestRateLimit,
+  rateLimitHeaders,
+  verifySameOriginRequest,
+} from "@/lib/request-security.js";
+import { verifyAppAccess } from "@/lib/app-access.js";
 
 export const runtime = "nodejs";
 export const maxDuration = 120;
+const MAX_TRANSPORT_BYTES = 4 * 1024 * 1024;
+const REQUIRED_OCR_MODE = "force";
 
-function jsonResponse(body, status = 200) {
+function jsonResponse(body, status = 200, extraHeaders = {}) {
   return NextResponse.json(body, {
     status,
     headers: {
       "Cache-Control": "no-store",
       "X-Content-Type-Options": "nosniff",
+      ...extraHeaders,
     },
   });
 }
 
 function errorPayload(error) {
   if (error instanceof DocumentProcessingError) {
+    console.warn("Document processing rejected", { code: error.code, status: error.status });
     return {
       code: error.code,
       message: error.message,
@@ -42,8 +51,11 @@ function errorPayload(error) {
   return { code: "INTERNAL_ERROR", message: "课件处理失败，请稍后重试。", status: 500 };
 }
 
-async function processDocument(file, onProgress, onCheckpoint, signal, ocrMode, ocrManifest, checkpoint) {
-  const document = checkpoint?.document ?? await parseDocument(file, { onProgress, ocrMode, ocrManifest });
+async function processDocument(clientMetadata, onProgress, onCheckpoint, signal, ocrMode, ocrManifest, checkpoint) {
+  const pipelineDeadlineAt = Date.now() + 100_000;
+  const document = checkpoint?.document ?? (
+    await parseClientDocument(clientMetadata, { onProgress, ocrMode, ocrManifest })
+  );
   if (!checkpoint) onCheckpoint?.("parsed", document);
   const apiKey = process.env.DASHSCOPE_API_KEY;
   let enrichedDocument = document;
@@ -52,6 +64,7 @@ async function processDocument(file, onProgress, onCheckpoint, signal, ocrMode, 
     const vision = await analyzeVisualCandidates(parsedManifest, apiKey, {
       signal,
       fileName: document.name,
+      deadlineAt: Math.min(pipelineDeadlineAt, Date.now() + 50_000),
       onProgress: ({ current, total, message }) => onProgress?.({
         phase: "vision",
         current,
@@ -76,6 +89,7 @@ async function processDocument(file, onProgress, onCheckpoint, signal, ocrMode, 
   try {
     const chunks = await embedDocumentChunks(enrichedDocument.chunks, apiKey, {
       signal,
+      deadlineAt: pipelineDeadlineAt,
       onProgress: ({ completed, total }) => onProgress?.({
         phase: "embedding",
         current: completed,
@@ -97,7 +111,7 @@ async function processDocument(file, onProgress, onCheckpoint, signal, ocrMode, 
   }
 }
 
-function streamDocument(file, signal, ocrMode, ocrManifest, checkpoint) {
+function streamDocument(clientMetadata, signal, ocrMode, ocrManifest, checkpoint) {
   const encoder = new TextEncoder();
   const workController = new AbortController();
   let streamClosed = false;
@@ -121,9 +135,15 @@ function streamDocument(file, signal, ocrMode, ocrManifest, checkpoint) {
         void (async () => {
           try {
             const document = await processDocument(
-              file,
+              clientMetadata,
               (progress) => send({ type: "progress", ...progress }),
-              (stage, document) => send({ type: "checkpoint", stage, document }),
+              (stage, document) => {
+                const checkpointPayload = JSON.stringify(document);
+                const checkpointSignature = signDocumentCheckpoint(checkpointPayload, stage);
+                if (checkpointSignature) {
+                  send({ type: "checkpoint", stage, document, checkpointPayload, checkpointSignature });
+                }
+              },
               workController.signal,
               ocrMode,
               ocrManifest,
@@ -165,31 +185,121 @@ function streamDocument(file, signal, ocrMode, ocrManifest, checkpoint) {
 }
 
 export async function POST(request) {
-  const contentLength = Number(request.headers.get("content-length") ?? 0);
-  const requestLimit = DOCUMENT_LIMITS.maxFileBytes + OCR_LIMITS.maxManifestBytes + DOCUMENT_CHECKPOINT_MAX_BYTES + 1024 * 1024;
+  const originCheck = verifySameOriginRequest(request);
+  if (!originCheck.allowed) {
+    return jsonResponse({
+      error: {
+        code: originCheck.code,
+        message: "已阻止跨站上传请求，请从本应用页面重新操作。",
+      },
+    }, originCheck.status);
+  }
+  const appAccess = verifyAppAccess(request);
+  if (appAccess.configurationMissing) {
+    return jsonResponse({
+      error: { code: "APP_ACCESS_NOT_CONFIGURED", message: "服务器尚未配置项目访问密钥。" },
+    }, 503);
+  }
+  if (!appAccess.authorized) {
+    return jsonResponse({
+      error: { code: "APP_ACCESS_REQUIRED", message: "请先输入项目访问密钥。" },
+    }, 401);
+  }
+  const rateLimit = checkRequestRateLimit(request, {
+    scope: "documents",
+    limit: 8,
+    windowMs: 15 * 60 * 1_000,
+  });
+  if (!rateLimit.allowed) {
+    return jsonResponse({
+      error: {
+        code: "RATE_LIMITED",
+        message: "上传处理过于频繁，请稍后再试。",
+        details: { canRetry: true },
+      },
+    }, 429, rateLimitHeaders(rateLimit));
+  }
+
+  const contentLengthHeader = request.headers.get("content-length");
+  const contentLength = Number(contentLengthHeader);
+  const requestLimit = MAX_TRANSPORT_BYTES;
+  if (!contentLengthHeader || !Number.isFinite(contentLength) || contentLength <= 0) {
+    return jsonResponse(
+      {
+        error: {
+          code: "CONTENT_LENGTH_REQUIRED",
+          message: "无法确认上传数据大小，请使用页面中的上传入口后重试。",
+          details: { canRetry: true },
+        },
+      },
+      411,
+    );
+  }
   if (contentLength > requestLimit) {
     return jsonResponse(
       {
         error: {
           code: "REQUEST_TOO_LARGE",
-          message: `上传内容超过 ${DOCUMENT_LIMITS.maxFileBytes / 1024 / 1024}MB 限制。`,
+          message: "浏览器提取结果超过线上传输上限，请减少图表数量或拆分课件后重试。原始课件仍可保留 20MB 上限。",
+          details: { canRetry: true },
         },
       },
       413,
     );
   }
+  if (!request.headers.get("content-type")?.toLowerCase().startsWith("multipart/form-data;")) {
+    return jsonResponse({
+      error: {
+        code: "UNSUPPORTED_MEDIA_TYPE",
+        message: "上传请求格式无效，请从页面重新选择文件。",
+      },
+    }, 415);
+  }
 
   try {
     const formData = await request.formData();
     const file = formData.get("file");
-    const requestedOcrMode = formData.get("ocrMode");
-    const ocrMode = ["auto", "force"].includes(requestedOcrMode) ? requestedOcrMode : "none";
-    const ocrManifest = formData.get("ocrManifest");
-    const checkpoint = parseDocumentCheckpoint(formData.get("documentCheckpoint"), formData.get("checkpointStage"));
-    if (request.headers.get("accept")?.includes("application/x-ndjson")) {
-      return streamDocument(file, request.signal, ocrMode, ocrManifest, checkpoint);
+    if (file instanceof File) {
+      return jsonResponse(
+        {
+          error: {
+            code: "CLIENT_EXTRACTION_REQUIRED",
+            message: "当前上传入口只接收浏览器完成的全页 OCR 结果，请刷新页面后重试。",
+            details: { canRetry: true },
+          },
+        },
+        400,
+      );
     }
-    const document = await processDocument(file, undefined, undefined, request.signal, ocrMode, ocrManifest, checkpoint);
+    const clientMetadata = {
+      name: formData.get("fileName"),
+      type: formData.get("fileType"),
+      size: formData.get("fileSize"),
+    };
+    const requestedOcrMode = formData.get("ocrMode");
+    if (requestedOcrMode !== REQUIRED_OCR_MODE) {
+      return jsonResponse(
+        {
+          error: {
+            code: "FULL_PAGE_OCR_REQUIRED",
+            message: "当前版本要求对每一页执行 OCR，请刷新页面后重新上传。",
+            details: { canRetry: true },
+          },
+        },
+        400,
+      );
+    }
+    const ocrMode = REQUIRED_OCR_MODE;
+    const ocrManifest = formData.get("ocrManifest");
+    const checkpoint = parseDocumentCheckpoint(
+      formData.get("documentCheckpoint"),
+      formData.get("checkpointStage"),
+      formData.get("checkpointSignature"),
+    );
+    if (request.headers.get("accept")?.includes("application/x-ndjson")) {
+      return streamDocument(clientMetadata, request.signal, ocrMode, ocrManifest, checkpoint);
+    }
+    const document = await processDocument(clientMetadata, undefined, undefined, request.signal, ocrMode, ocrManifest, checkpoint);
     return jsonResponse({ document });
   } catch (error) {
     const payload = errorPayload(error);

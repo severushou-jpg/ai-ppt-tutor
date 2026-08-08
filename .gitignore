@@ -13,14 +13,23 @@
 # testing
 /coverage
 /evaluation/reports/offline-latest.json
+/output/
+/.playwright-cli/
+/tmp/
+/Example_PDF/
+*.docx
+*.xlsx
 
 # next.js
 /.next/
+/.next-e2e/
 /out/
 
 # production
 /build
 /public/pdf.worker.min.mjs
+/public/tesseract/
+/public/tessdata/
 
 # misc
 .DS_Store

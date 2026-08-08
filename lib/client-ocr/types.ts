@@ -19,12 +19,13 @@ export interface OcrPageResult {
 }
 
 export interface OcrManifest {
-  version: 2;
-  mode: "auto" | "force";
+  version: 4;
+  mode: OcrMode;
   engine: "tesseract.js";
   sourceType: "pdf" | "pptx";
   languages: string[];
   pages: OcrPageResult[];
+  nativePages: Array<{ number: number; text: string }>;
   inspectedPageCount: number;
   visuals: VisualCandidate[];
 }
@@ -43,11 +44,11 @@ export interface RenderedPage {
   number: number;
   canvas: HTMLCanvasElement;
   nativeTextLength: number;
-  release: () => void;
+  nativeText: string;
 }
 
 export interface BrowserOcrOptions {
   signal: AbortSignal;
-  mode: "auto" | "force";
+  mode: OcrMode;
   onProgress?: (progress: BrowserOcrProgress) => void;
 }
