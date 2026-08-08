@@ -7,8 +7,8 @@
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --font-sans: Arial, Helvetica, sans-serif;
+  --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
 }
 
 * {
@@ -142,6 +142,54 @@ input:focus-visible {
 .citation-chip:hover {
   border-color: #60a5fa;
   background: #dbeafe;
+}
+
+.study-markdown > :first-child {
+  margin-top: 0;
+}
+
+.study-markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.study-markdown h1,
+.study-markdown h2,
+.study-markdown h3 {
+  margin: 1.15rem 0 0.45rem;
+  color: #0f172a;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.study-markdown h2 {
+  font-size: 1rem;
+}
+
+.study-markdown h3 {
+  font-size: 0.925rem;
+}
+
+.study-markdown p,
+.study-markdown ul,
+.study-markdown ol {
+  margin: 0.65rem 0;
+}
+
+.study-markdown ul,
+.study-markdown ol {
+  padding-left: 1.25rem;
+}
+
+.study-markdown ul {
+  list-style: disc;
+}
+
+.study-markdown ol {
+  list-style: decimal;
+}
+
+.study-markdown li {
+  margin: 0.25rem 0;
 }
 
 @media (prefers-reduced-motion: reduce) {

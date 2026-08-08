@@ -1,7 +1,7 @@
 import type { VisualCandidate } from "./types";
 
-const MAX_PREVIEW_EDGE = 960;
-const MAX_DATA_URL_LENGTH = 420_000;
+const MAX_PREVIEW_EDGE = 800;
+const MAX_DATA_URL_LENGTH = 180_000;
 
 function clamp(value: number, minimum: number, maximum: number) {
   return Math.min(maximum, Math.max(minimum, value));

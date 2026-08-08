@@ -17,6 +17,18 @@ import {
   parseStructuredResponse,
   renderStructuredMarkdown,
 } from "@/lib/structured-response.js";
+import {
+  DEFAULT_TEXT_MODEL,
+  generationVersionMetadata,
+  isGroundingEnabled,
+  parseExperimentMetadata,
+} from "@/lib/experiment.js";
+import {
+  checkRequestRateLimit,
+  rateLimitHeaders,
+  verifySameOriginRequest,
+} from "@/lib/request-security.js";
+import { verifyAppAccess } from "@/lib/app-access.js";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -27,6 +39,7 @@ const MAX_QUESTION_LENGTH = 2_000;
 const MAX_HISTORY_ITEMS = 10;
 const MAX_HISTORY_CONTENT = 4_000;
 const MAX_REQUEST_BYTES = 8_000_000;
+const TEXT_MODEL = process.env.DASHSCOPE_TEXT_MODEL || DEFAULT_TEXT_MODEL;
 
 const MODE_INSTRUCTIONS = {
   tutor: `你不是一次性回答器，而是负责让学生真正掌握内容的导师。根据对话历史判断当前阶段，并按“诊断先修知识 → 建立直觉 → 分步讲解 → 示范例题 → 引导练习 → 掌握检查 → 下一步”推进。一次只推进必要的阶段，不要把所有材料倾倒给学生。必须包含一个让学生主动回答的检查问题；不要立刻泄露该检查题答案。`,
@@ -51,10 +64,14 @@ function documentWideTaskInstruction(question, mode) {
   return `进行整课详细讲解：使用 6-8 个 sections，按课件顺序为每个实际主题模块分别讲清定义、工作机制、重要比较、实现方式和课件例子。不要用“学习目标/核心讲解/例子”三个通用大框笼统容纳整份课件，也不要逐页复述。最后可增加一个易错点与复习主线小节。`;
 }
 
-function jsonResponse(body, status = 200) {
+function jsonResponse(body, status = 200, extraHeaders = {}) {
   return NextResponse.json(body, {
     status,
-    headers: { "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" },
+    headers: {
+      "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+      ...extraHeaders,
+    },
   });
 }
 
@@ -85,7 +102,9 @@ function parseDocument(value) {
       id: chunk.id.slice(0, 120),
       fileName: String(chunk.fileName ?? value.name ?? "课件").slice(0, 180),
       kind: ["page", "slide", "section"].includes(chunk.kind) ? chunk.kind : "section",
-      number: Number.isFinite(Number(chunk.number)) ? Number(chunk.number) : 1,
+      number: Number.isInteger(Number(chunk.number)) && Number(chunk.number) >= 1 && Number(chunk.number) <= 120
+        ? Number(chunk.number)
+        : 1,
       label: chunk.label.slice(0, 80),
       title: String(chunk.title ?? chunk.label).slice(0, 140),
       contentType: VALID_CONTENT_TYPES.has(chunk.contentType) ? chunk.contentType : "prose",
@@ -131,7 +150,23 @@ function parsePayload(payload) {
   }
   const document = parseDocument(payload?.document);
   if (!document) return { error: { code: "DOCUMENT_REQUIRED", message: "请先上传并完成课件解析。" } };
-  return { question, mode, document, history: parseHistory(payload?.history) };
+  return {
+    question,
+    mode,
+    document,
+    history: parseHistory(payload?.history),
+    experiment: parseExperimentMetadata(payload?.experiment, document.id),
+  };
+}
+
+function buildBaselineSystemMessage(mode) {
+  return `你是一位大学课程学习助教。当前实验条件不提供课件检索证据或引用，请根据问题本身给出清晰、谨慎的教学回答。不得声称已经读取或核验课件原文；不确定时明确说明。请只输出有效 JSON，不要输出代码围栏。
+
+任务要求：${MODE_INSTRUCTIONS[mode]}
+
+严格使用以下结构：
+{"summary":"一句概述","sections":[{"heading":"小节标题","items":[{"text":"一个独立结论","citations":[],"supported":true}]}],"quiz":[],"partialRefusal":null,"suggestedQuestions":[]}
+非测验模式 quiz 必须为空；测验模式可生成 quiz，但 citations 保持空数组。`;
 }
 
 function buildSystemMessage(mode, groundingContext, sources, options = {}) {
@@ -195,7 +230,7 @@ async function callDashScope(messages, apiKey, requestSignal, options = {}) {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
         body: JSON.stringify({
-          model: "qwen-plus",
+          model: TEXT_MODEL,
           input: { messages },
           parameters: {
             result_format: "message",
@@ -209,9 +244,18 @@ async function callDashScope(messages, apiKey, requestSignal, options = {}) {
     );
     const data = await response.json().catch(() => null);
     if (!response.ok || data?.code) {
-      const error = new Error(data?.message || `上游服务返回 ${response.status}`);
-      error.code = response.status === 429 ? "MODEL_RATE_LIMIT" : "MODEL_REQUEST_FAILED";
-      error.status = response.status === 429 ? 429 : 502;
+      const rateLimited = response.status === 429;
+      console.error("DashScope generation rejected", {
+        status: response.status,
+        providerCode: String(data?.code ?? "").slice(0, 80),
+        providerMessage: String(data?.message ?? "").slice(0, 240),
+        requestId: String(data?.request_id ?? data?.requestId ?? "").slice(0, 120),
+      });
+      const error = new Error(rateLimited
+        ? "模型服务请求过于频繁，请稍后重试。"
+        : "模型服务暂时不可用，请稍后重试。");
+      error.code = rateLimited ? "MODEL_RATE_LIMIT" : "MODEL_REQUEST_FAILED";
+      error.status = rateLimited ? 429 : 502;
       throw error;
     }
     const content = data?.output?.choices?.[0]?.message?.content;
@@ -324,9 +368,55 @@ async function retrieveEvidence(parsed, apiKey, signal) {
 }
 
 export async function POST(request) {
-  const contentLength = Number(request.headers.get("content-length") ?? 0);
+  const originCheck = verifySameOriginRequest(request);
+  if (!originCheck.allowed) {
+    return jsonResponse({
+      error: {
+        code: originCheck.code,
+        message: "已阻止跨站生成请求，请从本应用页面重新操作。",
+      },
+    }, originCheck.status);
+  }
+  const appAccess = verifyAppAccess(request);
+  if (appAccess.configurationMissing) {
+    return jsonResponse({
+      error: { code: "APP_ACCESS_NOT_CONFIGURED", message: "服务器尚未配置项目访问密钥。" },
+    }, 503);
+  }
+  if (!appAccess.authorized) {
+    return jsonResponse({
+      error: { code: "APP_ACCESS_REQUIRED", message: "请先输入项目访问密钥。" },
+    }, 401);
+  }
+  const rateLimit = checkRequestRateLimit(request, {
+    scope: "ai",
+    limit: 40,
+    windowMs: 10 * 60 * 1_000,
+  });
+  if (!rateLimit.allowed) {
+    return jsonResponse({
+      error: {
+        code: "RATE_LIMITED",
+        message: "生成请求过于频繁，请稍后再试。",
+      },
+    }, 429, rateLimitHeaders(rateLimit));
+  }
+
+  const contentLengthHeader = request.headers.get("content-length");
+  const contentLength = Number(contentLengthHeader);
+  if (!contentLengthHeader || !Number.isFinite(contentLength) || contentLength <= 0) {
+    return jsonResponse({
+      error: {
+        code: "CONTENT_LENGTH_REQUIRED",
+        message: "无法确认请求大小，请刷新页面后重试。",
+      },
+    }, 411);
+  }
   if (contentLength > MAX_REQUEST_BYTES) {
     return jsonResponse({ error: { code: "REQUEST_TOO_LARGE", message: "本次请求内容过大，请重新上传较短的课件。" } }, 413);
+  }
+  if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
+    return jsonResponse({ error: { code: "UNSUPPORTED_MEDIA_TYPE", message: "请求格式无效，请刷新页面后重试。" } }, 415);
   }
 
   try {
@@ -334,6 +424,46 @@ export async function POST(request) {
     const parsed = parsePayload(payload);
     if (parsed.error) return jsonResponse({ error: parsed.error }, 400);
     const apiKey = process.env.DASHSCOPE_API_KEY;
+    const groundingEnabled = isGroundingEnabled(parsed.experiment.condition);
+    if (!apiKey) {
+      return jsonResponse({ error: { code: "SERVER_NOT_CONFIGURED", message: "服务器尚未配置 AI 服务密钥。" } }, 503);
+    }
+
+    if (!groundingEnabled) {
+      const retrieval = {
+        mode: "none",
+        reranked: false,
+        candidateCount: 0,
+        strategy: "ungrounded",
+        indexedPageCount: 0,
+        selectedPageCount: 0,
+        queryCount: 0,
+        visualCandidateCount: 0,
+      };
+      const messages = [
+        { role: "system", content: buildBaselineSystemMessage(parsed.mode) },
+        ...parsed.history,
+        { role: "user", content: `${parsed.question}\n\n请按照 JSON 格式输出。` },
+      ];
+      const modelContent = await callDashScope(messages, apiKey, request.signal);
+      const structured = parseStructuredResponse(modelContent, [], parsed.mode, { requireCitations: false });
+      if (!structured) {
+        const error = new Error("模型返回格式异常，请重试。");
+        error.code = "INVALID_MODEL_RESPONSE";
+        error.status = 502;
+        throw error;
+      }
+      return jsonResponse({
+        content: renderStructuredMarkdown(structured, parsed.mode),
+        structured,
+        grounded: false,
+        refused: false,
+        sources: [],
+        retrieval,
+        versionMetadata: generationVersionMetadata(parsed.experiment, TEXT_MODEL),
+      });
+    }
+
     const evidence = await retrieveEvidence(parsed, apiKey, request.signal);
     const retrieval = {
       mode: evidence.embeddingUsed ? "hybrid" : "lexical",
@@ -354,10 +484,6 @@ export async function POST(request) {
         retrieval,
       ));
     }
-    if (!apiKey) {
-      return jsonResponse({ error: { code: "SERVER_NOT_CONFIGURED", message: "服务器尚未配置 AI 服务密钥。" } }, 503);
-    }
-
     const sources = createSources(evidence.chunks, parsed.question);
     const messages = [
       {
@@ -399,6 +525,7 @@ export async function POST(request) {
       refused: !grounded,
       sources: grounded ? citedSources : [],
       retrieval,
+      versionMetadata: generationVersionMetadata(parsed.experiment, TEXT_MODEL),
     });
   } catch (error) {
     if (error instanceof SyntaxError) {
@@ -407,10 +534,18 @@ export async function POST(request) {
     const status = Number(error?.status) || 500;
     const code = error?.code || "INTERNAL_ERROR";
     if (status !== 499) console.error("AI request failed", { code, message: error?.message });
+    const publicMessages = {
+      MODEL_RATE_LIMIT: "模型服务请求过于频繁，请稍后重试。",
+      MODEL_REQUEST_FAILED: "模型服务暂时不可用，请稍后重试。",
+      MODEL_TIMEOUT: "模型响应超时，请重试。",
+      EMPTY_MODEL_RESPONSE: "模型没有返回有效内容，请重试。",
+      INVALID_MODEL_RESPONSE: "模型返回格式异常，请重试。",
+      REQUEST_ABORTED: "生成已停止。",
+    };
     return jsonResponse({
       error: {
         code,
-        message: status >= 500 && code === "INTERNAL_ERROR" ? "生成失败，请稍后重试。" : error.message,
+        message: publicMessages[code] ?? (status >= 500 ? "生成失败，请稍后重试。" : "请求未能完成，请重试。"),
       },
     }, status);
   }

@@ -1,9 +1,63 @@
 import type { BrowserOcrProgress, RenderedPage } from "./types";
 
 type PageConsumer = (page: RenderedPage, current: number, total: number) => Promise<void>;
+const MAX_RENDER_PIXELS = 8_000_000;
+const MAX_RENDER_EDGE = 4_096;
+const MAX_SOURCE_EDGE = 20_000;
+const SAFE_PPTX_ZIP_LIMITS = Object.freeze({
+  maxEntries: 1_500,
+  maxEntryUncompressedBytes: 32 * 1024 * 1024,
+  maxTotalUncompressedBytes: 128 * 1024 * 1024,
+  maxMediaBytes: 96 * 1024 * 1024,
+  maxConcurrency: 4,
+});
+
+function validRenderDimensions(width: number, height: number) {
+  return Number.isFinite(width) && Number.isFinite(height) &&
+    width > 0 && height > 0 && width <= MAX_SOURCE_EDGE && height <= MAX_SOURCE_EDGE;
+}
+
+function safeRenderScale(width: number, height: number, preferredScale = 2) {
+  if (!validRenderDimensions(width, height)) return 0;
+  return Math.min(
+    preferredScale,
+    Math.sqrt(MAX_RENDER_PIXELS / Math.max(1, width * height)),
+    MAX_RENDER_EDGE / width,
+    MAX_RENDER_EDGE / height,
+  );
+}
+
+function pdfItemsToText(items: unknown[]) {
+  const lines = new Map<number, Array<{ x: number; text: string }>>();
+  for (const item of items as Array<{ str?: string; transform?: number[] }>) {
+    const text = String(item?.str ?? "").replace(/\s+/g, " ").trim();
+    if (!text) continue;
+    const x = Number(item?.transform?.[4]) || 0;
+    const y = Number(item?.transform?.[5]) || 0;
+    const key = Math.round(y / 3) * 3;
+    if (!lines.has(key)) lines.set(key, []);
+    lines.get(key)?.push({ x, text });
+  }
+  return [...lines.entries()]
+    .sort(([left], [right]) => right - left)
+    .map(([, line]) => line.sort((left, right) => left.x - right.x).map((item) => item.text).join(" "))
+    .join("\n");
+}
 
 function throwIfAborted(signal: AbortSignal) {
   if (signal.aborted) throw new DOMException("OCR processing was aborted", "AbortError");
+}
+
+function readablePdfError(error: unknown) {
+  const name = error instanceof Error ? error.name : "";
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  if (/password/i.test(`${name} ${message}`)) {
+    return new Error("该 PDF 已加密，请先移除打开密码后再上传。");
+  }
+  if (/invalidpdf|invalid pdf|missing pdf|unexpected response/i.test(`${name} ${message}`)) {
+    return new Error("无法读取 PDF：文件可能已损坏，或内容与扩展名不一致。");
+  }
+  return new Error("无法读取 PDF，请确认文件完整、未加密且可以正常打开。");
 }
 
 function emitRenderingProgress(
@@ -28,10 +82,23 @@ export async function renderPdfPages(
 ) {
   const pdfjs = await import("pdfjs-dist");
   pdfjs.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
-  const loadingTask = pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) });
+  const loadingTask = pdfjs.getDocument({
+    data: new Uint8Array(await file.arrayBuffer()),
+    enableScripting: false,
+    isEvalSupported: false,
+    maxImageSize: MAX_RENDER_PIXELS,
+  } as Parameters<typeof pdfjs.getDocument>[0]);
   const abortLoading = () => loadingTask.destroy();
   signal.addEventListener("abort", abortLoading, { once: true });
-  const pdf = await loadingTask.promise;
+  let pdf;
+  try {
+    pdf = await loadingTask.promise;
+  } catch (error) {
+    signal.removeEventListener("abort", abortLoading);
+    await loadingTask.destroy().catch(() => undefined);
+    if (signal.aborted || (error instanceof DOMException && error.name === "AbortError")) throw error;
+    throw readablePdfError(error);
+  }
   try {
     if (pdf.numPages > 120) throw new Error("全页 OCR 最多支持 120 页，请拆分课件后重试。");
     for (let index = 0; index < pdf.numPages; index += 1) {
@@ -40,17 +107,11 @@ export async function renderPdfPages(
       emitRenderingProgress(onProgress, number, pdf.numPages, "页面");
       const page = await pdf.getPage(number);
       const textContent = await page.getTextContent();
-      const nativeTextLength = textContent.items.reduce(
-        (sum, item) => sum + ("str" in item ? String(item.str).trim().length : 0),
-        0,
-      );
+      const nativeText = pdfItemsToText(textContent.items as unknown[]);
+      const nativeTextLength = nativeText.length;
       const baseViewport = page.getViewport({ scale: 1 });
-      const maximumPixels = 8_000_000;
-      const preferredScale = 2;
-      const scale = Math.min(
-        preferredScale,
-        Math.sqrt(maximumPixels / Math.max(1, baseViewport.width * baseViewport.height)),
-      );
+      const scale = safeRenderScale(baseViewport.width, baseViewport.height);
+      if (scale <= 0) throw new Error(`第 ${number} 页尺寸异常，无法安全渲染。`);
       const viewport = page.getViewport({ scale });
       const canvas = document.createElement("canvas");
       canvas.width = Math.max(1, Math.floor(viewport.width));
@@ -65,11 +126,7 @@ export async function renderPdfPages(
           number,
           canvas,
           nativeTextLength,
-          release: () => {
-            canvas.width = 1;
-            canvas.height = 1;
-            page.cleanup();
-          },
+          nativeText,
         }, number, pdf.numPages);
       } finally {
         canvas.width = 1;
@@ -79,7 +136,7 @@ export async function renderPdfPages(
     }
   } finally {
     signal.removeEventListener("abort", abortLoading);
-    await pdf.destroy();
+    await loadingTask.destroy();
   }
 }
 
@@ -89,7 +146,7 @@ export async function renderPptxSlides(
   onProgress: ((progress: BrowserOcrProgress) => void) | undefined,
   consume: PageConsumer,
 ) {
-  const [{ PptxViewer, RECOMMENDED_ZIP_LIMITS }, html2canvasModule] = await Promise.all([
+  const [{ PptxViewer }, html2canvasModule] = await Promise.all([
     import("@aiden0z/pptx-renderer"),
     import("html2canvas"),
   ]);
@@ -108,9 +165,9 @@ export async function renderPptxSlides(
   const viewer = await PptxViewer.open(await file.arrayBuffer(), staging, {
     renderMode: "slide",
     fitMode: "none",
-    zipLimits: RECOMMENDED_ZIP_LIMITS,
-    lazyMedia: false,
-    lazySlides: false,
+    zipLimits: SAFE_PPTX_ZIP_LIMITS,
+    lazyMedia: true,
+    lazySlides: true,
     pdfjs: false,
     signal,
   });
@@ -118,6 +175,10 @@ export async function renderPptxSlides(
     const total = viewer.slideCount;
     if (total < 1) throw new Error("PPTX 中没有可渲染的幻灯片。");
     if (total > 120) throw new Error("全页 OCR 最多支持 120 张幻灯片，请拆分课件后重试。");
+    const slideWidth = Number(viewer.slideWidth);
+    const slideHeight = Number(viewer.slideHeight);
+    const slideScale = safeRenderScale(slideWidth, slideHeight);
+    if (slideScale <= 0) throw new Error("PPTX 幻灯片尺寸异常，无法安全渲染。");
     for (let index = 0; index < total; index += 1) {
       throwIfAborted(signal);
       const number = index + 1;
@@ -133,24 +194,22 @@ export async function renderPptxSlides(
         await handle.ready;
         await document.fonts?.ready;
         throwIfAborted(signal);
-        const nativeTextLength = (handle.element.textContent ?? "").replace(/\s+/g, " ").trim().length;
+        const nativeText = (handle.element.textContent ?? "").replace(/\s+/g, " ").trim();
+        const nativeTextLength = nativeText.length;
         const canvas = await html2canvas(handle.element, {
           backgroundColor: "#ffffff",
           logging: false,
-          scale: 2,
+          scale: slideScale,
           useCORS: true,
-          width: viewer.slideWidth,
-          height: viewer.slideHeight,
+          width: slideWidth,
+          height: slideHeight,
         });
         try {
           await consume({
             number,
             canvas,
             nativeTextLength,
-            release: () => {
-              canvas.width = 1;
-              canvas.height = 1;
-            },
+            nativeText,
           }, number, total);
         } finally {
           canvas.width = 1;

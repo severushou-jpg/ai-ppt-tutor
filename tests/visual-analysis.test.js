@@ -1,6 +1,22 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { analyzeVisualCandidates } from "../lib/visual-analysis.js";
+import {
+  analyzeVisualCandidates,
+  resolveMultimodalEndpoint,
+} from "../lib/visual-analysis.js";
+
+test("visual endpoint only accepts trusted Aliyun HTTPS hosts", () => {
+  assert.equal(
+    new URL(resolveMultimodalEndpoint("https://dashscope.aliyuncs.com/api/v1/test")).hostname,
+    "dashscope.aliyuncs.com",
+  );
+  assert.equal(
+    new URL(resolveMultimodalEndpoint("https://workspace.cn-beijing.maas.aliyuncs.com/api/v1/test")).hostname,
+    "workspace.cn-beijing.maas.aliyuncs.com",
+  );
+  assert.throws(() => resolveMultimodalEndpoint("http://dashscope.aliyuncs.com/test"), /HTTPS/);
+  assert.throws(() => resolveMultimodalEndpoint("https://attacker.example/test"), /受信任/);
+});
 
 test("visual analysis stops when the processing stream is cancelled", async () => {
   const originalFetch = globalThis.fetch;

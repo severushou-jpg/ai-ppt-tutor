@@ -13,7 +13,8 @@ test("none mode does not require an OCR manifest", () => {
 
 test("auto mode accepts selective OCR and validated visual crops", () => {
   const manifest = parseOcrManifest({
-    version: 2,
+    version: 4,
+    engine: "tesseract.js",
     mode: "auto",
     sourceType: "pdf",
     inspectedPageCount: 12,
@@ -34,6 +35,8 @@ test("auto mode accepts selective OCR and validated visual crops", () => {
 test("auto mode does not merge very low confidence OCR noise", () => {
   const ast = { content: [{ type: "page", metadata: { pageNumber: 1 }, text: "可靠原生文字" }] };
   const manifest = parseOcrManifest({
+    version: 4,
+    engine: "tesseract.js",
     mode: "auto",
     sourceType: "pdf",
     inspectedPageCount: 1,
@@ -47,12 +50,17 @@ test("auto mode does not merge very low confidence OCR noise", () => {
 
 test("force mode validates and normalizes page results", () => {
   const manifest = parseOcrManifest(JSON.stringify({
+    version: 4,
+    engine: "tesseract.js",
     mode: "force",
     sourceType: "pdf",
+    inspectedPageCount: 2,
     pages: [
       { number: 2, text: " 第二页\r\n文字 ", confidence: 88.8, durationMs: 1200 },
       { number: 1, text: "第一页", confidence: 101, durationMs: -1 },
     ],
+    nativePages: [{ number: 1, text: "" }, { number: 2, text: "" }],
+    visuals: [],
   }), "force");
   assert.deepEqual(manifest.pages.map((page) => page.number), [1, 2]);
   assert.equal(manifest.pages[0].confidence, 100);
@@ -63,8 +71,14 @@ test("force mode validates and normalizes page results", () => {
 test("force mode rejects duplicate page numbers", () => {
   assert.throws(
     () => parseOcrManifest({
+      version: 4,
+      engine: "tesseract.js",
       mode: "force",
+      sourceType: "pdf",
+      inspectedPageCount: 2,
       pages: [{ number: 1 }, { number: 1 }],
+      nativePages: [{ number: 1 }, { number: 2 }],
+      visuals: [],
     }, "force"),
     (error) => error instanceof OcrManifestError && error.code === "INVALID_OCR_PAGE",
   );
@@ -88,12 +102,17 @@ test("OCR results are applied to matching PDF pages with metadata", () => {
     ],
   };
   const manifest = parseOcrManifest({
+    version: 4,
+    engine: "tesseract.js",
     mode: "force",
     sourceType: "pdf",
+    inspectedPageCount: 2,
     pages: [
       { number: 1, text: "原生标题", confidence: 95, durationMs: 10 },
       { number: 2, text: "扫描页文字", confidence: 80, durationMs: 20 },
     ],
+    nativePages: [{ number: 1, text: "原生标题" }, { number: 2, text: "" }],
+    visuals: [],
   }, "force");
   const result = applyOcrManifest(ast, manifest);
   assert.equal(result.ast.content[0].metadata.textOrigin, "native");
@@ -101,4 +120,33 @@ test("OCR results are applied to matching PDF pages with metadata", () => {
   assert.equal(result.ast.content[1].metadata.textOrigin, "ocr");
   assert.equal(result.summary.successfulPageCount, 2);
   assert.equal(result.summary.averageConfidence, 87.5);
+});
+
+test("force mode rejects manifests that omit pages", () => {
+  assert.throws(
+    () => parseOcrManifest({
+      version: 4,
+      engine: "tesseract.js",
+      mode: "force",
+      sourceType: "pdf",
+      inspectedPageCount: 2,
+      pages: [{ number: 1, text: "第一页", confidence: 90, durationMs: 10 }],
+      nativePages: [{ number: 1, text: "第一页" }, { number: 2, text: "第二页" }],
+      visuals: [],
+    }, "force"),
+    (error) => error instanceof OcrManifestError && error.code === "INCOMPLETE_FULL_PAGE_OCR",
+  );
+});
+
+test("obsolete OCR manifest versions are rejected", () => {
+  assert.throws(
+    () => parseOcrManifest({
+      version: 3,
+      engine: "tesseract.js",
+      mode: "auto",
+      sourceType: "pdf",
+      pages: [],
+    }, "auto"),
+    (error) => error instanceof OcrManifestError && error.code === "OCR_MANIFEST_REQUIRED",
+  );
 });

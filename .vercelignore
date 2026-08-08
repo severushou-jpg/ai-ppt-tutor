@@ -1,0 +1,19 @@
+# Local-only datasets and review artifacts
+Example_PDF/
+*.docx
+*.xlsx
+
+# Development outputs
+.next/
+node_modules/
+coverage/
+evaluation/reports/
+output/
+.playwright-cli/
+
+# Local configuration and VCS metadata
+.env*
+!.env.example
+.git/
+.vercel/
+.DS_Store
