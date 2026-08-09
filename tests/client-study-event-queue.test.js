@@ -52,3 +52,27 @@ test("terminal response preserves unsent events for authoritative finalization r
   assert.equal(accepted, false);
   assert.deepEqual(queue, [{ queueId: "expired", event: { type: "ui_click" } }]);
 });
+
+test("finalization acknowledgement removes only queue entries explicitly accepted by client event ID", () => {
+  let queue = [
+    { queueId: "q-accepted", event: { type: "ui_click", data: { clientEventId: "c-accepted" } } },
+    { queueId: "q-rejected", event: { type: "ui_click", data: { clientEventId: "c-rejected" } } },
+  ];
+  const controller = createClientStudyEventQueue({
+    read: () => structuredClone(queue),
+    write: (next) => {
+      queue = structuredClone(next);
+    },
+    send: async () => ({ ok: false, terminal: true }),
+  });
+  const acceptedClientEventIds = new Set(["c-accepted"]);
+  const acceptedQueueIds = controller.pending()
+    .filter((entry) => acceptedClientEventIds.has(entry.event.data.clientEventId))
+    .map((entry) => entry.queueId);
+
+  controller.acknowledge(acceptedQueueIds);
+
+  assert.deepEqual(queue, [
+    { queueId: "q-rejected", event: { type: "ui_click", data: { clientEventId: "c-rejected" } } },
+  ]);
+});

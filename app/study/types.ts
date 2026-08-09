@@ -1,6 +1,46 @@
 export type StudyCondition = "A" | "B" | "C" | "D";
 export type StudyStratum = "novice" | "experienced";
 export type StudyStatus = "prepared" | "active" | "completed" | "interrupted" | "withdrawn";
+export type StudyParticipantStage =
+  | "information_sheet"
+  | "written_consent"
+  | "form1"
+  | "ready"
+  | "learning"
+  | "form3"
+  | "form2"
+  | "done"
+  | "halted";
+
+export interface StudyProcedure {
+  version: string;
+  informationSheetVersion: string;
+  informationSheetAcknowledgedAt: string | null;
+  writtenConsentConfirmedAt: string | null;
+  form1ConfirmedAt: string | null;
+  learningStartedAt: string | null;
+  learningEndedAt: string | null;
+  form3ConfirmedAt: string | null;
+  form2ConfirmedAt: string | null;
+  procedureCompletedAt: string | null;
+  haltedAt: string | null;
+}
+
+export type StudyProcedureAction =
+  | "acknowledge_information_sheet"
+  | "confirm_written_consent"
+  | "confirm_form1"
+  | "confirm_form3"
+  | "confirm_form2";
+
+export interface ExperimentAccessCapabilities {
+  configured: boolean;
+  authorized: boolean;
+  localBypass: boolean;
+  keyRequired: boolean;
+  requireResearcherKeyForConsent: boolean;
+  capability: "local-loopback" | "researcher-cookie" | "researcher-key" | "unavailable";
+}
 export type StudyFinalizeReason =
   | "time_limit"
   | "early_completion"
@@ -11,10 +51,13 @@ export type StudyFinalizeReason =
 export interface StudySession {
   studyId: string;
   status: StudyStatus;
+  participantStage: StudyParticipantStage;
+  procedure: StudyProcedure;
   createdAt: string;
   startedAt: string | null;
   scheduledEndAt: string | null;
   endedAt: string | null;
+  finalizationCompleteAt: string | null;
   durationSeconds: number;
   remainingSeconds: number;
   completionReason: StudyFinalizeReason | null;

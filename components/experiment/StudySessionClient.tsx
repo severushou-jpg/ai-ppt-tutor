@@ -7,14 +7,17 @@ import {
   Clock3,
   Flag,
   LoaderCircle,
-  LockKeyhole,
   Play,
   Send,
   Sparkles,
 } from "lucide-react";
 import { LectureViewer } from "./LectureViewer";
+import { ParticipantInformationGate } from "./ParticipantInformationGate";
+import { PostStudyFlow } from "./PostStudyFlow";
 import { StudyAnswerCard } from "./StudyAnswerCard";
+import { StudyFormQrStep } from "./StudyFormQrStep";
 import { createClientStudyEventQueue } from "@/lib/client-study-event-queue.js";
+import { STUDY_FORMS } from "@/lib/study/protocol-config.js";
 import {
   STUDY_DURATION_SECONDS,
   currentStudyKey,
@@ -22,9 +25,11 @@ import {
   readApiError,
   studyTokenKey,
   type EvidenceAnchor,
+  type ExperimentAccessCapabilities,
   type StudyChatMessage,
   type StudyEventPayload,
   type StudyFinalizeReason,
+  type StudyProcedureAction,
   type StudyResponse,
   type StudySession,
 } from "@/app/study/types";
@@ -120,9 +125,25 @@ function remainingFromSession(session: StudySession) {
   return Math.max(0, session.remainingSeconds ?? STUDY_DURATION_SECONDS);
 }
 
+function waitForAnimationFrames(frameCount = 2) {
+  return new Promise<void>((resolve) => {
+    let remaining = Math.max(1, frameCount);
+    const advance = () => {
+      remaining -= 1;
+      if (remaining <= 0) {
+        resolve();
+        return;
+      }
+      window.requestAnimationFrame(advance);
+    };
+    window.requestAnimationFrame(advance);
+  });
+}
+
 export function StudySessionClient({ initialStudyId }: { initialStudyId: string }) {
   const conversationRef = useRef<HTMLDivElement>(null);
   const sessionRef = useRef<StudySession | null>(null);
+  const mountedRef = useRef(false);
   const finishingRef = useRef(false);
   const finalizingRef = useRef(false);
   const finalizeRetryTimerRef = useRef<number | null>(null);
@@ -138,6 +159,7 @@ export function StudySessionClient({ initialStudyId }: { initialStudyId: string 
   const lastUserScrollIntentRef = useRef(0);
   const programmaticScrollRef = useRef(false);
   const sourceOpenedAtRef = useRef<{ anchorId: string; timestamp: number } | null>(null);
+  const logEventRef = useRef<(event: StudyEventPayload) => Promise<void>>(async () => undefined);
   const [studyId, setStudyId] = useState(initialStudyId);
   const [sessionToken, setSessionToken] = useState("");
   const [session, setSession] = useState<StudySession | null>(null);
@@ -155,10 +177,20 @@ export function StudySessionClient({ initialStudyId }: { initialStudyId: string 
   const [error, setError] = useState<string | null>(null);
   const [technicalFailure, setTechnicalFailure] = useState(false);
   const [finalizationStatus, setFinalizationStatus] = useState<"idle" | "saving" | "saved" | "retrying">("idle");
+  const [procedurePending, setProcedurePending] = useState(false);
+  const [procedureError, setProcedureError] = useState<string | null>(null);
+  const [requireResearcherKeyForConsent, setRequireResearcherKeyForConsent] = useState(true);
 
   useEffect(() => {
     sessionRef.current = session;
   }, [session]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     const previous = document.documentElement.lang;
@@ -206,6 +238,10 @@ export function StudySessionClient({ initialStudyId }: { initialStudyId: string 
     };
     await getEventQueue().enqueue({ queueId: createId(), event: preparedEvent });
   }, [getEventQueue, sessionToken, studyId]);
+
+  useEffect(() => {
+    logEventRef.current = logEvent;
+  }, [logEvent]);
 
   const finalizeStudy = useCallback(async (reason: StudyFinalizeReason = "time_limit") => {
     if (finalizingRef.current || !studyId || !sessionToken) return;
@@ -259,7 +295,9 @@ export function StudySessionClient({ initialStudyId }: { initialStudyId: string 
     await getEventQueue().flush();
     let saved = false;
     try {
-      const pendingEvents = getEventQueue().pending().map((entry: QueuedStudyEvent) => entry.event);
+      const queue = getEventQueue();
+      const pendingEntries = queue.pending().slice(0, 500) as QueuedStudyEvent[];
+      const pendingEvents = pendingEntries.map((entry) => entry.event);
       const response = await fetch("/api/study/finalize", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -270,23 +308,38 @@ export function StudySessionClient({ initialStudyId }: { initialStudyId: string 
           clientEndedAt: reason === "early_completion" ? intent.requestedAt : undefined,
           pendingEvents,
         }),
-        keepalive: true,
       });
       if (!response.ok) throw new Error(await readApiError(response, "The research record could not be finalized."));
-      const result = await response.json() as { session: StudySession };
-      setSession(result.session);
+      const result = await response.json() as { session: StudySession; acceptedClientEventIds?: string[] };
+      if (mountedRef.current) setSession(result.session);
       sessionRef.current = result.session;
-      writeEventQueue(studyId, []);
+      const acceptedClientEventIds = new Set(Array.isArray(result.acceptedClientEventIds) ? result.acceptedClientEventIds : []);
+      const acceptedQueueIds = pendingEntries
+        .filter((entry) => {
+          const clientEventId = entry.event.data?.clientEventId;
+          return typeof clientEventId === "string" && acceptedClientEventIds.has(clientEventId);
+        })
+        .map((entry) => entry.queueId);
+      queue.acknowledge(acceptedQueueIds);
+      const unresolvedEvents = queue.pending();
+      if (unresolvedEvents.length > 0) {
+        throw new Error(`${unresolvedEvents.length} learning event${unresolvedEvents.length === 1 ? " remains" : "s remain"} awaiting server confirmation.`);
+      }
       finalizationIntentRef.current = null;
       writeFinalizationIntent(studyId, null);
-      setPendingFinalizationReason(null);
-      setFinalizationStatus("saved");
-      setError(null);
       saved = true;
+      await waitForAnimationFrames(2);
+      if (mountedRef.current) {
+        setPendingFinalizationReason(null);
+        setFinalizationStatus("saved");
+        setError(null);
+      }
     } catch (caught) {
-      setTechnicalFailure(true);
-      setFinalizationStatus("retrying");
-      setError(caught instanceof Error ? caught.message : "The research record could not be finalized.");
+      if (mountedRef.current) {
+        setTechnicalFailure(true);
+        setFinalizationStatus("retrying");
+        setError(caught instanceof Error ? caught.message : "The research record could not be finalized.");
+      }
     } finally {
       sourceOpenedAtRef.current = null;
       finalizingRef.current = false;
@@ -348,12 +401,24 @@ export function StudySessionClient({ initialStudyId }: { initialStudyId: string 
       }
 
       try {
-        const response = await fetch(`/api/study/recover?studyId=${encodeURIComponent(resolvedStudyId)}`, {
-          cache: "no-store",
-          headers: { "x-study-session-token": token },
-        });
+        const [response, accessResponse] = await Promise.all([
+          fetch(`/api/study/recover?studyId=${encodeURIComponent(resolvedStudyId)}`, {
+            cache: "no-store",
+            headers: { "x-study-session-token": token },
+          }),
+          fetch("/api/experiment/access", { cache: "no-store" }).catch(() => null),
+        ]);
         if (!response.ok) throw new Error(await readApiError(response, "This study session could not be recovered."));
         const result = await response.json() as { session: StudySession };
+        if (accessResponse?.ok) {
+          const capabilities = await accessResponse.json().catch(() => null) as Partial<ExperimentAccessCapabilities> | null;
+          const keyRequired = typeof capabilities?.keyRequired === "boolean"
+            ? capabilities.keyRequired
+            : capabilities?.requireResearcherKeyForConsent;
+          if (typeof keyRequired === "boolean") {
+            setRequireResearcherKeyForConsent(keyRequired);
+          }
+        }
         if (cancelled) return;
         setSession(result.session);
         sessionRef.current = result.session;
@@ -371,14 +436,22 @@ export function StudySessionClient({ initialStudyId }: { initialStudyId: string 
         if (
           result.session.status === "completed" ||
           result.session.status === "interrupted" ||
-          result.session.status === "withdrawn" ||
-          (result.session.status === "active" && remaining <= 0)
+          result.session.status === "withdrawn"
         ) {
           setEnded(true);
           finishingRef.current = true;
           setFinalizationStatus("saved");
           finalizationIntentRef.current = null;
           writeFinalizationIntent(resolvedStudyId, null);
+        } else if (result.session.status === "active" && remaining <= 0) {
+          // Recovery after the deadline must still finalize the server record.
+          // Marking this as saved locally would strand an active session and
+          // bypass the durable study_ended event/summary write.
+          setEnded(true);
+          finishingRef.current = true;
+          setFinalizationStatus("retrying");
+          setRequestedFinalizationReason("time_limit");
+          setPendingFinalizationReason("time_limit");
         }
       } catch (caught) {
         if (!cancelled) setError(caught instanceof Error ? caught.message : "This study session could not be recovered.");
@@ -434,15 +507,25 @@ export function StudySessionClient({ initialStudyId }: { initialStudyId: string 
   }, [ended, getEventQueue, session?.status, sessionToken, studyId]);
 
   useEffect(() => {
-    if (session?.status !== "active" || ended) return;
-    history.pushState({ studySession: true }, "", window.location.href);
+    if (loading || !studyId || !sessionToken) return;
+    const current = sessionRef.current;
+    const terminal = finishingRef.current || current?.status === "completed"
+      || current?.status === "interrupted" || current?.status === "withdrawn";
+    if (!current || terminal) return;
+    history.pushState({ participantSessionLocked: true }, "", window.location.href);
     const preventBackNavigation = () => {
-      history.pushState({ studySession: true }, "", window.location.href);
-      void logEvent({ type: "back_navigation_blocked" });
+      const latestSession = sessionRef.current;
+      const terminating = finishingRef.current || latestSession?.status === "completed"
+        || latestSession?.status === "interrupted" || latestSession?.status === "withdrawn";
+      if (!latestSession || terminating) return;
+      history.pushState({ participantSessionLocked: true }, "", window.location.href);
+      if (latestSession.status === "active") {
+        void logEventRef.current({ type: "back_navigation_blocked" });
+      }
     };
     window.addEventListener("popstate", preventBackNavigation);
     return () => window.removeEventListener("popstate", preventBackNavigation);
-  }, [ended, logEvent, session?.status]);
+  }, [loading, sessionToken, studyId]);
 
   useEffect(() => {
     const conversation = conversationRef.current;
@@ -554,7 +637,6 @@ export function StudySessionClient({ initialStudyId }: { initialStudyId: string 
       finalizingRef.current = false;
       setFinalizationStatus("idle");
       setRequestedFinalizationReason(null);
-      writeEventQueue(studyId, []);
       finalizationIntentRef.current = null;
       writeFinalizationIntent(studyId, null);
       setEnded(false);
@@ -570,6 +652,32 @@ export function StudySessionClient({ initialStudyId }: { initialStudyId: string 
       setError(caught instanceof Error ? caught.message : "The learning session could not be started.");
     } finally {
       setStarting(false);
+    }
+  }
+
+  async function advanceProcedure(action: StudyProcedureAction, researcherKey?: string) {
+    if (!session || !studyId || !sessionToken || procedurePending) return;
+    setProcedurePending(true);
+    setProcedureError(null);
+    try {
+      const response = await fetch("/api/study/procedure", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          studyId,
+          sessionToken,
+          action,
+          ...(action === "confirm_written_consent" && researcherKey ? { researcherKey } : {}),
+        }),
+      });
+      if (!response.ok) throw new Error(await readApiError(response, "This study step could not be saved."));
+      const result = await response.json() as { session: StudySession };
+      setSession(result.session);
+      sessionRef.current = result.session;
+    } catch (caught) {
+      setProcedureError(caught instanceof Error ? caught.message : "This study step could not be saved.");
+    } finally {
+      setProcedurePending(false);
     }
   }
 
@@ -702,6 +810,15 @@ export function StudySessionClient({ initialStudyId }: { initialStudyId: string 
     void finalizeStudy("early_completion");
   }
 
+  function prepareNextParticipant() {
+    sessionStorage.removeItem(currentStudyKey());
+    sessionStorage.removeItem(studyTokenKey(studyId));
+    sessionStorage.removeItem(messageStorageKey(studyId));
+    sessionStorage.removeItem(eventQueueStorageKey(studyId));
+    sessionStorage.removeItem(finalizationIntentStorageKey(studyId));
+    window.location.replace("/study/setup");
+  }
+
   const active = session?.status === "active" && !ended && remainingSeconds > 0;
   const timerUrgent = remainingSeconds <= 120;
   const endedEarly = (session?.completionReason ?? requestedFinalizationReason) === "early_completion";
@@ -731,12 +848,92 @@ export function StudySessionClient({ initialStudyId }: { initialStudyId: string 
           <h1 className="mt-4 text-xl font-bold">Study session unavailable</h1>
           <p className="mt-3 text-sm leading-6 text-slate-600">{error}</p>
           <p className="mt-5 text-xs text-slate-500">Please return the computer to the researcher.</p>
+          {studyId ? (
+            <button
+              type="button"
+              onClick={prepareNextParticipant}
+              className="mt-5 h-10 rounded-xl border border-slate-200 bg-white px-4 text-xs font-bold text-slate-600 transition hover:bg-slate-50"
+            >
+              Researcher: Return to Setup
+            </button>
+          ) : null}
         </section>
       </main>
     );
   }
 
-  if (session.status === "prepared") {
+  if (session.status === "prepared" && (session.participantStage === "information_sheet" || session.participantStage === "written_consent")) {
+    return (
+      <ParticipantInformationGate
+        studyId={studyId}
+        stage={session.participantStage}
+        pending={procedurePending}
+        error={procedureError}
+        requireResearcherKey={requireResearcherKeyForConsent}
+        onAcknowledge={() => void advanceProcedure("acknowledge_information_sheet")}
+        onConfirmWrittenConsent={(researcherKey) => void advanceProcedure("confirm_written_consent", researcherKey)}
+      />
+    );
+  }
+
+  if (session.status === "prepared" && session.participantStage === "form1") {
+    return (
+      <StudyFormQrStep
+        studyId={studyId}
+        formLabel="Form 1 — Participant Intake and Eligibility"
+        title="Required before learning"
+        description="Scan the QR code and complete the participant intake and eligibility form. Use the exact Study ID shown on this page, submit the form, then confirm below."
+        imageSrc={STUDY_FORMS.form1.publicPath}
+        formUrl={STUDY_FORMS.form1.url}
+        confirmationLabel="I confirm that I have completed and submitted Form 1 — Participant Intake and Eligibility."
+        confirmButtonLabel="Form 1 Submitted — Continue"
+        pending={procedurePending}
+        error={procedureError}
+        onConfirm={() => void advanceProcedure("confirm_form1")}
+      />
+    );
+  }
+
+  if (ended || ["completed", "interrupted", "withdrawn"].includes(session.status)) {
+    const normalCompletion = session.status === "completed"
+      && (session.completionReason === "time_limit" || session.completionReason === "early_completion");
+    if (finalizationStatus !== "saved" || normalCompletion) {
+      return (
+        <PostStudyFlow
+          studyId={studyId}
+          stage={session.participantStage}
+          finalizationStatus={finalizationStatus}
+          endedEarly={endedEarly}
+          pending={procedurePending}
+          error={procedureError ?? error}
+          onConfirmForm3={() => void advanceProcedure("confirm_form3")}
+          onConfirmForm2={() => void advanceProcedure("confirm_form2")}
+          onPrepareNextParticipant={prepareNextParticipant}
+        />
+      );
+    }
+    return (
+      <main className="grid min-h-screen place-items-center bg-[#f4f7fb] p-6">
+        <section className="max-w-md rounded-3xl border border-amber-200 bg-white p-8 text-center shadow-xl">
+          <CircleAlert className="mx-auto h-10 w-10 text-amber-500" aria-hidden="true" />
+          <h1 className="mt-4 text-xl font-bold">The study has stopped</h1>
+          <p className="mt-3 text-sm leading-6 text-slate-600">
+            This session did not end through the normal timed or early-completion route, so the post-study forms are not available.
+          </p>
+          <p className="mt-5 text-sm font-bold text-slate-800">Please return the computer to the researcher.</p>
+          <button
+            type="button"
+            onClick={prepareNextParticipant}
+            className="mt-5 h-10 rounded-xl border border-slate-200 bg-white px-4 text-xs font-bold text-slate-600 transition hover:bg-slate-50"
+          >
+            Researcher: Close Session and Return to Setup
+          </button>
+        </section>
+      </main>
+    );
+  }
+
+  if (session.status === "prepared" && session.participantStage === "ready") {
     return (
       <main className="relative grid min-h-screen place-items-center overflow-hidden bg-[#f4f7fb] p-5">
         <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_20%_5%,rgba(37,99,235,0.14),transparent_36%),radial-gradient(circle_at_85%_12%,rgba(99,102,241,0.13),transparent_34%)]" />
@@ -781,6 +978,20 @@ export function StudySessionClient({ initialStudyId }: { initialStudyId: string 
               {starting ? "Starting…" : "Start Learning"}
             </button>
           </div>
+        </section>
+      </main>
+    );
+  }
+
+  if (session.status !== "active" || session.participantStage !== "learning") {
+    return (
+      <main className="grid min-h-screen place-items-center bg-[#f4f7fb] p-6">
+        <section className="max-w-md rounded-3xl border border-amber-200 bg-white p-8 text-center shadow-xl">
+          <CircleAlert className="mx-auto h-10 w-10 text-amber-500" aria-hidden="true" />
+          <h1 className="mt-4 text-xl font-bold">Study stage unavailable</h1>
+          <p className="mt-3 text-sm leading-6 text-slate-600">
+            The saved study stage does not match this page. Please return the computer to the researcher.
+          </p>
         </section>
       </main>
     );
@@ -959,56 +1170,6 @@ export function StudySessionClient({ initialStudyId }: { initialStudyId: string 
                 Finish Now
               </button>
             </div>
-          </section>
-        </div>
-      ) : null}
-
-      {ended ? (
-        <div className="fixed inset-0 z-[70] grid place-items-center bg-slate-950/60 p-5 backdrop-blur-sm">
-          <section className="w-full max-w-lg rounded-[2rem] border border-white/20 bg-white p-8 text-center shadow-[0_35px_100px_rgba(15,23,42,0.35)] sm:p-10">
-            <div className="mx-auto grid h-16 w-16 place-items-center rounded-2xl bg-slate-100 text-slate-700">
-              <LockKeyhole className="h-8 w-8" aria-hidden="true" />
-            </div>
-            <p className="mt-6 text-xs font-bold uppercase tracking-[0.18em] text-blue-600">Study session complete</p>
-            <h2 className="mt-3 text-2xl font-bold tracking-tight">
-              {endedEarly ? "You have finished learning." : "The learning time has ended."}
-            </h2>
-            <p className="mt-4 text-sm leading-6 text-slate-600">
-              The tutor and original lecture are now locked. This session cannot be resumed.
-            </p>
-            <div className="mt-6 rounded-2xl border border-blue-100 bg-blue-50/70 p-5 text-left">
-              <p className="text-xs font-bold uppercase tracking-[0.14em] text-blue-700">Continue in this order</p>
-              <ol className="mt-3 space-y-3 text-sm text-slate-700">
-                <li className="flex gap-3">
-                  <span className="grid h-6 w-6 shrink-0 place-items-center rounded-full bg-blue-600 text-xs font-bold text-white">1</span>
-                  <span><strong>Form 3 — Unaided Quiz.</strong> Complete the quiz without using the tutor or lecture.</span>
-                </li>
-                <li className="flex gap-3">
-                  <span className="grid h-6 w-6 shrink-0 place-items-center rounded-full bg-indigo-600 text-xs font-bold text-white">2</span>
-                  <span><strong>Form 2 — Post-Learning Questionnaire.</strong> Complete it only after submitting Form 3.</span>
-                </li>
-              </ol>
-            </div>
-            <p className="mt-4 text-xs leading-5 text-slate-500">Please inform the researcher before continuing.</p>
-            <div className={`mx-auto mt-5 inline-flex items-center gap-2 rounded-full px-3.5 py-2 text-xs font-semibold ${
-              finalizationStatus === "saved"
-                ? "bg-emerald-50 text-emerald-700"
-                : finalizationStatus === "retrying"
-                  ? "bg-amber-50 text-amber-800"
-                  : "bg-blue-50 text-blue-700"
-            }`} role="status">
-              {finalizationStatus === "saved" ? (
-                "Research record saved"
-              ) : (
-                <>
-                  <LoaderCircle className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
-                  {finalizationStatus === "retrying" ? "Retrying secure save…" : "Securing research record…"}
-                </>
-              )}
-            </div>
-            {finalizationStatus === "retrying" && error ? (
-              <p className="mt-3 text-xs leading-5 text-amber-700">{error} Keep this page open; saving will retry automatically.</p>
-            ) : null}
           </section>
         </div>
       ) : null}

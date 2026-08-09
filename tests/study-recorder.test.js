@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  advanceStudyProcedure,
   appendStudyEvent,
   authorizeStudySession,
   createStudySession,
@@ -33,6 +34,17 @@ async function createStartedSession(t, overrides = {}) {
     stratum: overrides.stratum ?? "novice",
     metadata: overrides.metadata,
   }, { root, now: createdAt });
+  for (const [index, action] of [
+    "acknowledge_information_sheet",
+    "confirm_written_consent",
+    "confirm_form1",
+  ].entries()) {
+    await advanceStudyProcedure({
+      studyId: created.session.studyId,
+      sessionToken: created.sessionToken,
+      action,
+    }, { root, now: createdAt + 100 + index * 100 });
+  }
   const started = await startStudySession({
     studyId: created.session.studyId,
     sessionToken: created.sessionToken,
@@ -72,6 +84,8 @@ test("Create reserves an isolated record and prevents duplicate Study IDs", asyn
   assert.equal(first.session.condition, undefined);
   assert.equal(first.session.stratum, undefined);
   assert.equal(first.session.status, "prepared");
+  assert.equal(first.session.participantStage, "information_sheet");
+  assert.equal(first.session.procedure.informationSheetAcknowledgedAt, null);
   assert.equal(first.session.durationSeconds, 1_500);
   assert.equal(first.session.sessionTokenHash, undefined);
   assert.match(first.sessionToken, /^[a-f0-9]{64}$/);
