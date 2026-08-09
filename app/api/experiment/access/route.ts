@@ -1,5 +1,3 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
-import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
 import {
   checkRequestRateLimit,
@@ -7,40 +5,25 @@ import {
   verifySameOriginRequest,
 } from "@/lib/request-security.js";
 import { verifyAppAccess } from "@/lib/app-access.js";
+import {
+  EXPERIMENT_ADMIN_COOKIE,
+  configuredExperimentAdminKey,
+  experimentAdminCapability,
+  experimentAdminSignature,
+  shouldUseSecureExperimentCookie,
+  verifyExperimentAdminKey,
+} from "@/lib/experiment-admin.js";
 
 export const runtime = "nodejs";
 
-const COOKIE_NAME = "ai-ppt-experiment-admin";
-const COOKIE_VALUE = "authorized";
-
-function signature(secret: string) {
-  return createHmac("sha256", secret).update(COOKIE_VALUE).digest("hex");
-}
-
-function configuredSecret() {
-  return process.env.EXPERIMENT_ADMIN_KEY?.trim() ?? "";
-}
-
-function equalSecret(left: string, right: string) {
-  const leftBytes = Buffer.from(left);
-  const rightBytes = Buffer.from(right);
-  return leftBytes.length === rightBytes.length && timingSafeEqual(leftBytes, rightBytes);
-}
-
-async function authorized() {
-  const secret = configuredSecret();
-  if (!secret) return false;
-  const value = (await cookies()).get(COOKIE_NAME)?.value ?? "";
-  return equalSecret(value, signature(secret));
-}
-
-export async function GET() {
-  return NextResponse.json({ authorized: await authorized() }, {
+export async function GET(request: Request) {
+  return NextResponse.json(experimentAdminCapability(request), {
     headers: { "Cache-Control": "no-store" },
   });
 }
 
 export async function POST(request: Request) {
+  const experimentAccess = experimentAdminCapability(request);
   const originCheck = verifySameOriginRequest(request);
   if (!originCheck.allowed) {
     return NextResponse.json({
@@ -48,15 +31,20 @@ export async function POST(request: Request) {
     }, { status: originCheck.status });
   }
   const appAccess = verifyAppAccess(request);
-  if (appAccess.configurationMissing) {
-    return NextResponse.json({
-      error: { code: "APP_ACCESS_NOT_CONFIGURED", message: "服务器尚未配置项目访问密钥。" },
-    }, { status: 503 });
-  }
-  if (!appAccess.authorized) {
+  if (appAccess.configured && !appAccess.authorized) {
     return NextResponse.json({
       error: { code: "APP_ACCESS_REQUIRED", message: "请先输入项目访问密钥。" },
     }, { status: 401 });
+  }
+  if (appAccess.configurationMissing && !experimentAccess.localBypass) {
+    return NextResponse.json({
+      error: { code: "APP_ACCESS_NOT_CONFIGURED", message: "生产环境尚未配置项目访问密钥。" },
+    }, { status: 503 });
+  }
+  if (experimentAccess.localBypass) {
+    return NextResponse.json(experimentAccess, {
+      headers: { "Cache-Control": "no-store" },
+    });
   }
   const rateLimit = checkRequestRateLimit(request, {
     scope: "experiment-access",
@@ -85,19 +73,26 @@ export async function POST(request: Request) {
       error: { code: "UNSUPPORTED_MEDIA_TYPE", message: "请求格式无效。" },
     }, { status: 415 });
   }
-  const secret = configuredSecret();
+  const secret = configuredExperimentAdminKey();
   if (!secret) {
     return NextResponse.json({ error: { code: "EXPERIMENT_NOT_CONFIGURED", message: "实验控制密钥尚未配置。" } }, { status: 503 });
   }
   const payload = await request.json().catch(() => null) as { key?: string } | null;
-  if (!payload?.key || !equalSecret(payload.key, secret)) {
+  if (!payload?.key || !verifyExperimentAdminKey(payload.key, secret)) {
     return NextResponse.json({ error: { code: "EXPERIMENT_ACCESS_DENIED", message: "实验控制密钥无效。" } }, { status: 401 });
   }
-  const response = NextResponse.json({ authorized: true });
-  response.cookies.set(COOKIE_NAME, signature(secret), {
+  const response = NextResponse.json({
+    configured: true,
+    authorized: true,
+    localBypass: false,
+    keyRequired: true,
+    requireResearcherKeyForConsent: true,
+    capability: "researcher-cookie",
+  }, { headers: { "Cache-Control": "no-store" } });
+  response.cookies.set(EXPERIMENT_ADMIN_COOKIE, experimentAdminSignature(secret), {
     httpOnly: true,
     sameSite: "strict",
-    secure: process.env.NODE_ENV === "production",
+    secure: shouldUseSecureExperimentCookie(request),
     path: "/",
     maxAge: 60 * 60 * 8,
   });

@@ -11,6 +11,7 @@ import {
   CircleAlert,
   CircleCheck,
   FlaskConical,
+  KeyRound,
   LoaderCircle,
   LockKeyhole,
   ShieldCheck,
@@ -22,6 +23,7 @@ import {
   currentStudyKey,
   readApiError,
   studyTokenKey,
+  type ExperimentAccessCapabilities,
   type StudyCondition,
   type StudySession,
   type StudyStratum,
@@ -50,6 +52,10 @@ function formatStudyId(value: string) {
 
 export default function StudySetupPage() {
   const router = useRouter();
+  const [researcherAccess, setResearcherAccess] = useState<"checking" | "authorized" | "unauthorized">("checking");
+  const [researcherKey, setResearcherKey] = useState("");
+  const [accessPending, setAccessPending] = useState(false);
+  const [accessError, setAccessError] = useState<string | null>(null);
   const [studyId, setStudyId] = useState("APTT-");
   const [stratum, setStratum] = useState<StudyStratum | "">("");
   const [condition, setCondition] = useState<StudyCondition | "">("");
@@ -77,6 +83,7 @@ export default function StudySetupPage() {
     setPreflightError(null);
     try {
       const response = await fetch("/api/study/preflight", { cache: "no-store" });
+      if (response.status === 401) setResearcherAccess("unauthorized");
       if (!response.ok) throw new Error(await readApiError(response, "The study readiness check failed."));
       setPreflight(await response.json() as StudyPreflightResult);
     } catch (caught) {
@@ -89,13 +96,64 @@ export default function StudySetupPage() {
 
   useEffect(() => {
     let cancelled = false;
+    async function checkResearcherAccess() {
+      const existingStudyId = sessionStorage.getItem(currentStudyKey()) || "";
+      const existingToken = /^APTT-\d{3}$/.test(existingStudyId)
+        ? sessionStorage.getItem(studyTokenKey(existingStudyId)) || ""
+        : "";
+      if (existingStudyId && existingToken) {
+        router.replace(`/study/session?studyId=${encodeURIComponent(existingStudyId)}`);
+        return;
+      }
+      try {
+        const response = await fetch("/api/experiment/access", { cache: "no-store" });
+        const result = await response.json().catch(() => null) as Partial<ExperimentAccessCapabilities> | null;
+        if (!cancelled) setResearcherAccess(result?.authorized || result?.localBypass ? "authorized" : "unauthorized");
+      } catch {
+        if (!cancelled) {
+          setResearcherAccess("unauthorized");
+          setAccessError("The researcher access check could not be completed.");
+        }
+      }
+    }
+    void checkResearcherAccess();
+    return () => {
+      cancelled = true;
+    };
+  }, [router]);
+
+  useEffect(() => {
+    if (researcherAccess !== "authorized") return;
+    let cancelled = false;
     queueMicrotask(() => {
       if (!cancelled) void runPreflight();
     });
     return () => {
       cancelled = true;
     };
-  }, [runPreflight]);
+  }, [researcherAccess, runPreflight]);
+
+  async function unlockResearcherSetup(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!researcherKey.trim() || accessPending) return;
+    setAccessPending(true);
+    setAccessError(null);
+    try {
+      const response = await fetch("/api/experiment/access", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key: researcherKey }),
+      });
+      if (!response.ok) throw new Error(await readApiError(response, "Researcher access was denied."));
+      setResearcherKey("");
+      setResearcherAccess("authorized");
+    } catch (caught) {
+      setResearcherKey("");
+      setAccessError(caught instanceof Error ? caught.message : "Researcher access was denied.");
+    } finally {
+      setAccessPending(false);
+    }
+  }
 
   async function prepareSession(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -117,6 +175,7 @@ export default function StudySetupPage() {
           },
         }),
       });
+      if (response.status === 401) setResearcherAccess("unauthorized");
       if (!response.ok) {
         throw new Error(await readApiError(response, "The study session could not be prepared."));
       }
@@ -131,6 +190,68 @@ export default function StudySetupPage() {
       setError(caught instanceof Error ? caught.message : "The study session could not be prepared.");
       setSubmitting(false);
     }
+  }
+
+  if (researcherAccess === "checking") {
+    return (
+      <main className="grid min-h-screen place-items-center bg-[#f4f7fb] p-6">
+        <div className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-white px-6 py-4 text-sm font-medium text-slate-600 shadow-lg">
+          <LoaderCircle className="h-5 w-5 animate-spin text-violet-600" aria-hidden="true" />
+          Checking researcher authorization…
+        </div>
+      </main>
+    );
+  }
+
+  if (researcherAccess === "unauthorized") {
+    return (
+      <main className="relative grid min-h-screen place-items-center overflow-hidden bg-[#f4f7fb] p-5">
+        <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_20%_5%,rgba(99,102,241,0.14),transparent_36%),radial-gradient(circle_at_85%_12%,rgba(37,99,235,0.13),transparent_34%)]" />
+        <section className="relative w-full max-w-md overflow-hidden rounded-[2rem] border border-slate-200 bg-white shadow-[0_30px_90px_rgba(15,23,42,0.14)]">
+          <div className="bg-gradient-to-br from-slate-950 via-indigo-950 to-blue-900 px-8 py-8 text-white">
+            <div className="grid h-14 w-14 place-items-center rounded-2xl bg-white/12 ring-1 ring-white/20">
+              <LockKeyhole className="h-7 w-7" aria-hidden="true" />
+            </div>
+            <p className="mt-5 text-xs font-bold uppercase tracking-[0.18em] text-blue-200">Restricted area</p>
+            <h1 className="mt-2 text-3xl font-bold tracking-tight">Researcher setup</h1>
+            <p className="mt-3 text-sm leading-6 text-blue-100/80">Authenticate before viewing or assigning any experimental condition.</p>
+          </div>
+          <form className="p-8" onSubmit={unlockResearcherSetup}>
+            <label className="block">
+              <span className="mb-2 block text-sm font-semibold text-slate-800">Researcher control key</span>
+              <div className="relative">
+                <KeyRound className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" aria-hidden="true" />
+                <input
+                  type="password"
+                  value={researcherKey}
+                  onChange={(event) => setResearcherKey(event.target.value)}
+                  autoComplete="off"
+                  autoFocus
+                  spellCheck={false}
+                  className="h-12 w-full rounded-xl border border-slate-200 bg-slate-50 pl-11 pr-4 text-sm text-slate-900 transition focus:border-violet-400 focus:bg-white focus:outline-none focus:ring-4 focus:ring-violet-50"
+                  placeholder="Enter researcher key"
+                />
+              </div>
+            </label>
+            {accessError ? (
+              <div role="alert" className="mt-4 flex gap-3 rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-800">
+                <CircleAlert className="mt-0.5 h-5 w-5 shrink-0" aria-hidden="true" />
+                <span>{accessError}</span>
+              </div>
+            ) : null}
+            <button
+              type="submit"
+              disabled={!researcherKey.trim() || accessPending}
+              className="mt-6 inline-flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-slate-950 px-5 text-sm font-bold text-white shadow-lg shadow-slate-200 transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-300 disabled:shadow-none"
+            >
+              {accessPending ? <LoaderCircle className="h-4 w-4 animate-spin" aria-hidden="true" /> : <ShieldCheck className="h-4 w-4" aria-hidden="true" />}
+              {accessPending ? "Authenticating…" : "Unlock Researcher Setup"}
+            </button>
+            <Link href="/" className="mt-5 block text-center text-xs font-medium text-slate-500 underline underline-offset-4 hover:text-slate-800">Return to version selection</Link>
+          </form>
+        </section>
+      </main>
+    );
   }
 
   return (

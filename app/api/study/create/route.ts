@@ -1,5 +1,5 @@
 import { createStudySession } from "@/lib/study/recorder.js";
-import { noStoreJson, readStudyJson, studyErrorResponse } from "@/lib/study/http.js";
+import { readStudyJson, studyErrorResponse } from "@/lib/study/http.js";
 import { assertStudyPreflight } from "@/lib/study/preflight.js";
 import {
   STUDY_MATERIAL_VERSION,
@@ -11,11 +11,21 @@ import {
   FROZEN_CITATION_MAP_VERSION,
 } from "@/lib/study/frozen-initial-answer.js";
 import { RELATIONAL_MODEL_PDF_SHA256 } from "@/lib/study/relational-model-material.js";
+import { NextResponse } from "next/server";
+import { EXPERIMENT_ADMIN_COOKIE, experimentAdminCapability } from "@/lib/experiment-admin.js";
+import { StudyError } from "@/lib/study/validation.js";
 
 export const runtime = "nodejs";
 
 export async function POST(request: Request) {
   try {
+    const admin = experimentAdminCapability(request);
+    if (!admin.authorized && !admin.configured) {
+      throw new StudyError("EXPERIMENT_NOT_CONFIGURED", "The researcher control key is not configured.", 503);
+    }
+    if (!admin.authorized) {
+      throw new StudyError("EXPERIMENT_ADMIN_REQUIRED", "Researcher authorization is required.", 401);
+    }
     const payload = await readStudyJson(request, 16 * 1024);
     await assertStudyPreflight();
     const result = await createStudySession({
@@ -34,7 +44,14 @@ export async function POST(request: Request) {
           "local-working-tree",
       },
     });
-    return noStoreJson({ session: result.session, sessionToken: result.sessionToken }, 201);
+    const response = NextResponse.json({ session: result.session, sessionToken: result.sessionToken }, {
+      status: 201,
+      headers: { "Cache-Control": "no-store" },
+    });
+    // A remote participant never inherits the setup privilege. Localhost
+    // sessions use the request-scoped loopback capability instead of a cookie.
+    response.cookies.delete(EXPERIMENT_ADMIN_COOKIE);
+    return response;
   } catch (error) {
     return studyErrorResponse(error);
   }

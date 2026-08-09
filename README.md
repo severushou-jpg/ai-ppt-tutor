@@ -20,6 +20,8 @@ DASHSCOPE_VISION_MODEL=qwen3-vl-plus
 CHECKPOINT_SIGNING_SECRET=a_different_long_random_secret
 # 公网部署强烈建议设置；设置后访问者必须先输入此密钥。
 APP_ACCESS_KEY=a_long_random_access_key
+# 仅用于非本机/公网访问研究设置和确认书面同意；localhost 本地实验会自动跳过该密钥门。
+EXPERIMENT_ADMIN_KEY=a_different_long_random_researcher_key
 ```
 
 不要提交包含真实密钥的 `.env.local`。`CHECKPOINT_SIGNING_SECRET` 必须与 DashScope API Key 不同；公网部署时还应在 Vercel 设置 `APP_ACCESS_KEY`，并配合 Vercel Firewall 或共享限流服务设置每日额度。
@@ -35,7 +37,9 @@ npm run build
 npm run study
 ```
 
-打开 [http://localhost:3000](http://localhost:3000)，选择 **Research Study**。研究者输入 `APTT-###`，将 `Prior database experience` 设为 `Novice` 或 `Experienced`，再选择 A/B/C/D 条件并把电脑交给参与者。参与者点击 **Start Learning** 后才开始最长 25 分钟的计时与记录；学习完成后可以二次确认并提前结束。到时或提前结束都会立即锁定交互、保存真实学习时长，随后应先完成 Form 3 Quiz，再完成 Form 2 Post-Learning Questionnaire。
+打开 [http://127.0.0.1:3000](http://127.0.0.1:3000)，选择 **Research Study**。在 localhost 本机实验中，系统会直接进入设置页，不再要求研究者控制密钥。研究者输入 `APTT-###`，将 `Prior database experience` 设为 `Novice` 或 `Experienced`，选择 A/B/C/D 条件并创建本次会话，然后把电脑交给参与者。创建后直到研究者在完成页明确选择下一位参与者，返回键或直接访问 `/study/setup` 都只会恢复当前会话，不会暴露分组。随后按冻结流程完成：参与者阅读并确认 Participant Information Sheet；研究者确认已收到单独的书面同意书；参与者用相同 Study ID 完成 Form 1；最后才会出现 **Start Learning**。非本机或未来公网访问仍要求 `EXPERIMENT_ADMIN_KEY`，避免分组暴露。
+
+点击 **Start Learning** 后才开始最长 25 分钟的计时与学习事件记录；学习完成后可以二次确认并提前结束。到时或提前结束都会立即锁定交互，只有研究记录保存成功后才进入独立的无辅助测验页面。参与者必须依次完成 Form 3 Quiz、Form 2 Post-Learning Questionnaire，最后将电脑交还研究者。每一步同时提供二维码和直接打开 Microsoft Forms 的按钮，并在刷新后恢复到服务器已保存的步骤。
 
 - A：无证据约束、无可核验来源归因
 - B：有证据约束、无可核验来源归因
@@ -47,6 +51,9 @@ npm run study
 - 有来源的条件可点击句子级标记，在右侧打开原始 PDF 的对应页并高亮支持文本。
 - 参与者可以在固定条件下自由追问；每次回答继续遵守该条件的证据与来源规则。
 - 每位参与者的数据独立写入 `~/Desktop/research_record/APTT-###/`。可用 `STUDY_RECORD_ROOT` 更改根目录，用 `STUDY_BUILD_COMMIT` 写入版本标签。
+- Information Sheet、书面同意确认和三份表单的过程时间戳保存在会话过程元数据中，不计入 25 分钟学习行为日志；Information Sheet 确认不替代学校要求的书面同意。
+- 正常到时或主动提前完成才会进入 Form 3 → Form 2；技术中断、参与者撤回或研究者停止不会显示正式后测，而会提示联系研究者。
+- Form 3 页面会完全卸载讲解、课件和对话，防止无辅助测验期间查看答案。
 - 正式开始前，系统会检查固定 PDF 哈希、冻结回答包、引用映射、API Key 和记录目录写权限。实验版仅支持 localhost，不应部署到 Vercel。
 - 自动回归覆盖概览、详细讲解、生动示例、概念比较和连续追问，并验证 A=C、B=D、引用可见性、课件证据注入和条件盲化。
 

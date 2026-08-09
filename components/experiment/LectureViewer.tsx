@@ -25,7 +25,7 @@ interface MinimalPdfPage {
     canvasContext: CanvasRenderingContext2D;
     viewport: { width: number; height: number };
     transform?: number[];
-  }): { promise: Promise<void>; cancel(): void };
+  }): MinimalPdfRenderTask;
   getTextContent(): Promise<{
     items: Array<{
       str?: string;
@@ -37,10 +37,23 @@ interface MinimalPdfPage {
   cleanup(): void;
 }
 
+interface MinimalPdfRenderTask {
+  promise: Promise<void>;
+  cancel(): void;
+}
+
 interface MinimalPdfDocument {
   numPages: number;
   getPage(page: number): Promise<MinimalPdfPage>;
   destroy(): Promise<void>;
+}
+
+interface PdfRenderState {
+  page: MinimalPdfPage | null;
+  renderTask: MinimalPdfRenderTask | null;
+  disposed: boolean;
+  renderCancelled: boolean;
+  pageCleaned: boolean;
 }
 
 function validRectangle(rectangle: EvidenceRectangle) {
@@ -119,6 +132,7 @@ export function LectureViewer({
   const pageSurfaceRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const documentRef = useRef<MinimalPdfDocument | null>(null);
+  const renderStateRef = useRef<PdfRenderState | null>(null);
   const renderedAnchorRef = useRef<string>("");
   const [page, setPage] = useState(1);
   const [pageCount, setPageCount] = useState(27);
@@ -131,6 +145,53 @@ export function LectureViewer({
   const [highlights, setHighlights] = useState<EvidenceRectangle[]>([]);
   const [preciseHighlight, setPreciseHighlight] = useState(true);
   const [canvasSize, setCanvasSize] = useState({ width: 1, height: 1 });
+
+  const teardownRenderState = useCallback((state: PdfRenderState | null = renderStateRef.current) => {
+    const ownsCanvas = state === null || renderStateRef.current === state;
+    if (state) {
+      state.disposed = true;
+      if (state.renderTask && !state.renderCancelled) {
+        state.renderCancelled = true;
+        try {
+          state.renderTask.cancel();
+        } catch {
+          // PDF.js may already have settled the task.
+        }
+      }
+      if (state.page && !state.pageCleaned) {
+        state.pageCleaned = true;
+        try {
+          state.page.cleanup();
+        } catch {
+          // Cleanup is best-effort during a synchronous React teardown.
+        }
+      }
+      if (renderStateRef.current === state) renderStateRef.current = null;
+    }
+    if (ownsCanvas) {
+      const canvas = canvasRef.current;
+      if (canvas) {
+        canvas.width = 1;
+        canvas.height = 1;
+        canvas.style.width = "1px";
+        canvas.style.height = "1px";
+      }
+    }
+  }, []);
+
+  const teardownDocument = useCallback((document: MinimalPdfDocument | null = documentRef.current) => {
+    // Safari is sensitive to destroying a PDF document while its canvas render
+    // is still active. Cancel and release page/canvas resources synchronously,
+    // then destroy the document and absorb an already-settled destroy race.
+    teardownRenderState();
+    if (documentRef.current === document) documentRef.current = null;
+    if (!document) return;
+    try {
+      void document.destroy().catch(() => undefined);
+    } catch {
+      // Some PDF.js versions can throw synchronously when already destroyed.
+    }
+  }, [teardownRenderState]);
 
   useEffect(() => {
     let disposed = false;
@@ -146,7 +207,7 @@ export function LectureViewer({
         } as Parameters<typeof pdfjs.getDocument>[0]);
         current = await task.promise as unknown as MinimalPdfDocument;
         if (disposed) {
-          await current.destroy();
+          teardownDocument(current);
           return;
         }
         documentRef.current = current;
@@ -162,10 +223,9 @@ export function LectureViewer({
     void loadDocument();
     return () => {
       disposed = true;
-      documentRef.current = null;
-      if (current) void current.destroy();
+      teardownDocument(current);
     };
-  }, []);
+  }, [teardownDocument]);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -207,14 +267,26 @@ export function LectureViewer({
     const canvas = canvasRef.current;
     if (!document || !canvas || !documentReady) return;
     if (activeAnchor && activeAnchor.pdfPage !== page) return;
+    teardownRenderState();
     let cancelled = false;
-    let pageProxy: MinimalPdfPage | null = null;
-    let renderTask: { promise: Promise<void>; cancel(): void } | null = null;
+    const renderState: PdfRenderState = {
+      page: null,
+      renderTask: null,
+      disposed: false,
+      renderCancelled: false,
+      pageCleaned: false,
+    };
+    renderStateRef.current = renderState;
 
     async function renderPage() {
       try {
         setLoading(true);
-        pageProxy = await document!.getPage(page);
+        const pageProxy = await document!.getPage(page);
+        renderState.page = pageProxy;
+        if (cancelled || renderState.disposed) {
+          teardownRenderState(renderState);
+          return;
+        }
         const baseViewport = pageProxy.getViewport({ scale: 1 });
         const fitScale = Math.max(0.2, (hostWidth - (expanded ? 64 : 24)) / baseViewport.width);
         const scale = fitScale * zoom;
@@ -228,13 +300,13 @@ export function LectureViewer({
         canvas!.style.height = `${viewport.height}px`;
         context.fillStyle = "#ffffff";
         context.fillRect(0, 0, canvas!.width, canvas!.height);
-        renderTask = pageProxy.render({
+        renderState.renderTask = pageProxy.render({
           canvas: canvas!,
           canvasContext: context,
           viewport,
           transform: ratio === 1 ? undefined : [ratio, 0, 0, ratio, 0, 0],
         });
-        await renderTask.promise;
+        await renderState.renderTask.promise;
         if (cancelled) return;
         setCanvasSize({ width: viewport.width, height: viewport.height });
 
@@ -285,10 +357,9 @@ export function LectureViewer({
     void renderPage();
     return () => {
       cancelled = true;
-      renderTask?.cancel();
-      pageProxy?.cleanup();
+      teardownRenderState(renderState);
     };
-  }, [activeAnchor, documentReady, expanded, hostWidth, onAnchorRendered, page, zoom]);
+  }, [activeAnchor, documentReady, expanded, hostWidth, onAnchorRendered, page, teardownRenderState, zoom]);
 
   const setManualPage = useCallback((next: number) => {
     if (disabled) return;
