@@ -24,7 +24,7 @@ import { verifyAppAccess } from "@/lib/app-access.js";
 export const runtime = "nodejs";
 export const maxDuration = 120;
 const MAX_TRANSPORT_BYTES = 4 * 1024 * 1024;
-const REQUIRED_OCR_MODE = "force";
+const OCR_MODES = new Set(["none", "auto", "force"]);
 
 function jsonResponse(body, status = 200, extraHeaders = {}) {
   return NextResponse.json(body, {
@@ -53,6 +53,13 @@ function errorPayload(error) {
 
 async function processDocument(clientMetadata, onProgress, onCheckpoint, signal, ocrMode, ocrManifest, checkpoint) {
   const pipelineDeadlineAt = Date.now() + 100_000;
+  if (checkpoint && checkpoint.document?.ocr?.mode !== ocrMode) {
+    throw new DocumentProcessingError(
+      "OCR_MODE_MISMATCH",
+      "OCR 模式与已保存的处理阶段不一致，请重新处理课件。",
+      400,
+    );
+  }
   const document = checkpoint?.document ?? (
     await parseClientDocument(clientMetadata, { onProgress, ocrMode, ocrManifest })
   );
@@ -195,11 +202,6 @@ export async function POST(request) {
     }, originCheck.status);
   }
   const appAccess = verifyAppAccess(request);
-  if (appAccess.configurationMissing) {
-    return jsonResponse({
-      error: { code: "APP_ACCESS_NOT_CONFIGURED", message: "服务器尚未配置项目访问密钥。" },
-    }, 503);
-  }
   if (!appAccess.authorized) {
     return jsonResponse({
       error: { code: "APP_ACCESS_REQUIRED", message: "请先输入项目访问密钥。" },
@@ -264,7 +266,7 @@ export async function POST(request) {
         {
           error: {
             code: "CLIENT_EXTRACTION_REQUIRED",
-            message: "当前上传入口只接收浏览器完成的全页 OCR 结果，请刷新页面后重试。",
+            message: "当前上传入口只接收浏览器完成的逐页提取结果，请刷新页面后重试。",
             details: { canRetry: true },
           },
         },
@@ -277,19 +279,19 @@ export async function POST(request) {
       size: formData.get("fileSize"),
     };
     const requestedOcrMode = formData.get("ocrMode");
-    if (requestedOcrMode !== REQUIRED_OCR_MODE) {
+    if (!OCR_MODES.has(requestedOcrMode)) {
       return jsonResponse(
         {
           error: {
-            code: "FULL_PAGE_OCR_REQUIRED",
-            message: "当前版本要求对每一页执行 OCR，请刷新页面后重新上传。",
+            code: "INVALID_OCR_MODE",
+            message: "OCR 模式无效，请刷新页面后重新选择。",
             details: { canRetry: true },
           },
         },
         400,
       );
     }
-    const ocrMode = REQUIRED_OCR_MODE;
+    const ocrMode = requestedOcrMode;
     const ocrManifest = formData.get("ocrManifest");
     const checkpoint = parseDocumentCheckpoint(
       formData.get("documentCheckpoint"),

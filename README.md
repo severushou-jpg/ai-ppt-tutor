@@ -18,13 +18,13 @@ npm run dev
 DASHSCOPE_API_KEY=your_dashscope_api_key
 DASHSCOPE_VISION_MODEL=qwen3-vl-plus
 CHECKPOINT_SIGNING_SECRET=a_different_long_random_secret
-# 公网部署强烈建议设置；设置后访问者必须先输入此密钥。
+# 可选：设置后访问者必须先输入此密钥；不设置时正常用户版直接开放。
 APP_ACCESS_KEY=a_long_random_access_key
 # 仅用于非本机/公网访问研究设置和确认书面同意；localhost 本地实验会自动跳过该密钥门。
 EXPERIMENT_ADMIN_KEY=a_different_long_random_researcher_key
 ```
 
-不要提交包含真实密钥的 `.env.local`。`CHECKPOINT_SIGNING_SECRET` 必须与 DashScope API Key 不同；公网部署时还应在 Vercel 设置 `APP_ACCESS_KEY`，并配合 Vercel Firewall 或共享限流服务设置每日额度。
+不要提交包含真实密钥的 `.env.local`。`CHECKPOINT_SIGNING_SECRET` 必须与 DashScope API Key 不同。正常用户版默认可直接进入；如需限制访问，可在 Vercel 设置 `APP_ACCESS_KEY`。公开部署会消耗模型额度，建议配合 Vercel Firewall 或共享限流服务设置每日额度。
 
 ## 2×2 研究实验版
 
@@ -62,7 +62,7 @@ npm run study
 ## 当前能力
 
 - 支持 PDF、PPTX，单文件最大 20MB
-- 全页 OCR 固定启用，所有 PDF 页面和 PPTX 幻灯片都会进入本机 OCR 管线，不提供绕过选项
+- 提供“自动（推荐）”“不使用 OCR”“全页 OCR”三种模式；自动模式只识别缺少文字层的页面，全页模式适合扫描课件
 - PDF 与 PPTX 共用“页面渲染 → Canvas → Tesseract.js”管线，OCR 文本与原生文字去重合并，并按置信度降权
 - 自动检测教学价值较高的图表、表格、流程图和代码截图，裁剪后由 `qwen3-vl-plus` 分析
 - 图片来源保留页码、裁剪区域、视觉摘要和缩略图，回答可直接引用并在来源栏核对
@@ -97,7 +97,7 @@ npm run eval
 
 ## 已知限制
 
-- 全页 OCR 会消耗用户设备的 CPU、内存和电量；长课件在手机或低配置设备上处理较慢。
+- 自动或全页 OCR 会消耗用户设备的 CPU、内存和电量；长课件在手机或低配置设备上处理较慢。
 - OCR 当前使用简体中文和英文模型；复杂公式、低分辨率图表和特殊字体可能识别不准确。
 - PDF.js Worker、Tesseract.js Worker/WASM 核心和中英文语言模型均随项目自托管，不依赖第三方 CDN。
 - OCR 本身在浏览器本地完成；逐页提取的文字会发送到本项目服务端，并发送到已配置的 DashScope 服务生成 Embedding。候选图表裁剪会发送到视觉模型；提问时，问题、有限对话历史和检索到的课件证据会发送到文本生成与重排序模型。处理敏感、保密或受限制课件前，应确认阿里云账号区域、数据保留政策与所在机构的合规要求。
