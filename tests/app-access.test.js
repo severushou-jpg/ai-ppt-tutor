@@ -14,18 +14,6 @@ test("app access is open when no key is configured", () => {
     configured: false,
     authorized: true,
   });
-  assert.deepEqual(verifyAppAccess({ headers: new Headers() }, "", { production: true }), {
-    configured: false,
-    authorized: false,
-    configurationMissing: true,
-  });
-  assert.deepEqual(verifyAppAccess({ headers: new Headers() }, "", {
-    production: true,
-    allowPublic: true,
-  }), {
-    configured: false,
-    authorized: true,
-  });
 });
 
 test("app access requires a valid signed HttpOnly-cookie value", () => {

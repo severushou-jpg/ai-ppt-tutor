@@ -22,14 +22,7 @@ function noStore(body: unknown, status = 200, headers: Record<string, string> = 
 }
 
 export async function GET(request: Request) {
-  const access = verifyAppAccess(request);
-  if (access.configurationMissing) {
-    return noStore({
-      ...access,
-      error: { code: "APP_ACCESS_NOT_CONFIGURED", message: "服务器尚未配置 APP_ACCESS_KEY。" },
-    }, 503);
-  }
-  return noStore(access);
+  return noStore(verifyAppAccess(request));
 }
 
 export async function POST(request: Request) {
@@ -62,12 +55,7 @@ export async function POST(request: Request) {
   }
   const secret = configuredAppAccessKey();
   if (!secret) {
-    if (process.env.NODE_ENV !== "production" || process.env.ALLOW_PUBLIC_AI === "true") {
-      return noStore({ configured: false, authorized: true });
-    }
-    return noStore({
-      error: { code: "APP_ACCESS_NOT_CONFIGURED", message: "服务器尚未配置 APP_ACCESS_KEY。" },
-    }, 503);
+    return noStore({ configured: false, authorized: true });
   }
   const payload = await request.json().catch(() => null) as { key?: string } | null;
   if (!payload?.key || !verifyAppAccessKey(payload.key, secret)) {

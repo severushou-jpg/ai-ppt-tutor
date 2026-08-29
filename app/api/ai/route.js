@@ -378,11 +378,6 @@ export async function POST(request) {
     }, originCheck.status);
   }
   const appAccess = verifyAppAccess(request);
-  if (appAccess.configurationMissing) {
-    return jsonResponse({
-      error: { code: "APP_ACCESS_NOT_CONFIGURED", message: "服务器尚未配置项目访问密钥。" },
-    }, 503);
-  }
   if (!appAccess.authorized) {
     return jsonResponse({
       error: { code: "APP_ACCESS_REQUIRED", message: "请先输入项目访问密钥。" },

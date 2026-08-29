@@ -36,11 +36,6 @@ export async function POST(request: Request) {
       error: { code: "APP_ACCESS_REQUIRED", message: "请先输入项目访问密钥。" },
     }, { status: 401 });
   }
-  if (appAccess.configurationMissing && !experimentAccess.localBypass) {
-    return NextResponse.json({
-      error: { code: "APP_ACCESS_NOT_CONFIGURED", message: "生产环境尚未配置项目访问密钥。" },
-    }, { status: 503 });
-  }
   if (experimentAccess.localBypass) {
     return NextResponse.json(experimentAccess, {
       headers: { "Cache-Control": "no-store" },

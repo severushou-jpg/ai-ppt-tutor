@@ -92,9 +92,10 @@ import {
 
 const MAX_FILE_BYTES = 20 * 1024 * 1024;
 const CURRENT_DOCUMENT_INDEX_VERSION = DOCUMENT_INDEX_VERSION;
-const REQUIRED_OCR_MODE: OcrMode = "force";
+const DEFAULT_OCR_MODE: OcrMode = "auto";
+const OCR_MODES = new Set<OcrMode>(["auto", "none", "force"]);
 const DEFAULT_PROGRESS: StudyProgress = { mastery: "not_started", completedChunkIds: [] };
-const VISIBLE_MODES: LearningMode[] = ["tutor", "explain"];
+const VISIBLE_MODES: LearningMode[] = ["tutor", "explain", "qa", "quiz", "review"];
 
 const MASTERY_COPY: Record<MasteryStatus, string> = {
   not_started: "未学习",
@@ -161,7 +162,7 @@ const UPLOAD_COPY: Record<UploadPhase, { title: string; detail: string }> = {
   hashing: { title: "正在检查课件缓存", detail: "通过 SHA-256 判断是否已经解析过" },
   preparing_ocr: { title: "正在准备 OCR", detail: "首次使用需要加载中英文识别模型" },
   rendering: { title: "正在渲染课件页面", detail: "所有 OCR 处理都在当前浏览器完成" },
-  ocr: { title: "正在进行全页 OCR", detail: "请保持页面打开" },
+  ocr: { title: "正在进行 OCR", detail: "请保持页面打开" },
   uploading: { title: "正在上传课件", detail: "请保持页面打开" },
   parsing: { title: "正在解析文字与结构", detail: "按页或幻灯片保留来源" },
   indexing: { title: "正在建立课件索引", detail: "马上就可以开始学习" },
@@ -204,14 +205,24 @@ function formatBytes(bytes: number) {
   return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
 }
 
-function isCurrentFullOcrDocument(document: DocumentIndex | null | undefined) {
+function isCurrentOcrDocument(
+  document: DocumentIndex | null | undefined,
+  expectedMode?: OcrMode,
+) {
+  const documentMode = document?.ocr?.mode;
+  if (
+    !document ||
+    document.indexVersion !== CURRENT_DOCUMENT_INDEX_VERSION ||
+    !documentMode ||
+    !OCR_MODES.has(documentMode) ||
+    (expectedMode && documentMode !== expectedMode)
+  ) return false;
+  if (documentMode !== "force") return true;
+
   const total = document?.ocr?.totalPageCount;
   const successful = document?.ocr?.successfulPageCount;
   const failed = document?.ocr?.failedPageCount;
   return Boolean(
-    document &&
-    document.indexVersion === CURRENT_DOCUMENT_INDEX_VERSION &&
-    document.ocr?.mode === REQUIRED_OCR_MODE &&
     Number.isInteger(total) && Number(total) >= 1 &&
     Number(successful) + Number(failed) === Number(total) &&
     document.ocr?.inspectedPageCount === total,
@@ -221,16 +232,16 @@ function isCurrentFullOcrDocument(document: DocumentIndex | null | undefined) {
 function currentWorkspaceSummaries(summaries: WorkspaceSummary[]) {
   return summaries.filter((summary) =>
     summary.indexVersion === CURRENT_DOCUMENT_INDEX_VERSION &&
-    summary.ocrMode === REQUIRED_OCR_MODE,
+    OCR_MODES.has(summary.ocrMode),
   );
 }
 
 function isCompatibleProcessingJob(job: ProcessingJob | null | undefined) {
   return Boolean(
     job &&
-    job.ocrMode === REQUIRED_OCR_MODE &&
-    (!job.ocrManifest || job.ocrManifest.version === 4) &&
-    (!job.documentCheckpoint || isCurrentFullOcrDocument(job.documentCheckpoint)),
+    OCR_MODES.has(job.ocrMode) &&
+    (!job.ocrManifest || (job.ocrManifest.version === 4 && job.ocrManifest.mode === job.ocrMode)) &&
+    (!job.documentCheckpoint || isCurrentOcrDocument(job.documentCheckpoint, job.ocrMode)),
   );
 }
 
@@ -511,6 +522,7 @@ export default function Home() {
   const [uploadError, setUploadError] = useState<ApiError | null>(null);
   const [requestError, setRequestError] = useState<string | null>(null);
   const [mode, setMode] = useState<LearningMode>("tutor");
+  const [ocrMode, setOcrMode] = useState<OcrMode>(DEFAULT_OCR_MODE);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [dragging, setDragging] = useState(false);
@@ -631,6 +643,7 @@ export default function Home() {
     setDocumentIndex(snapshot.documentIndex);
     setMessages(snapshot.messages);
     setMode(snapshot.mode);
+    setOcrMode(snapshot.ocrMode);
     setStudyProgress(snapshot.progress);
     setUploadPhase("ready");
     const latestAssistant = [...snapshot.messages].reverse().find((message) => message.role === "assistant");
@@ -657,7 +670,7 @@ export default function Home() {
       .then(async ([snapshot, summaries, jobs]) => {
         if (cancelled) return;
         setWorkspaceSummaries(currentWorkspaceSummaries(summaries));
-        if (snapshot?.documentIndex && !isCurrentFullOcrDocument(snapshot.documentIndex)) {
+        if (snapshot?.documentIndex && !isCurrentOcrDocument(snapshot.documentIndex, snapshot.ocrMode)) {
           setDocumentIndex(null);
           setMessages([]);
           setActiveSources([]);
@@ -711,7 +724,7 @@ export default function Home() {
         documentIndex,
         messages,
         mode,
-        ocrMode: REQUIRED_OCR_MODE,
+        ocrMode: documentIndex.ocr?.mode ?? "none",
         progress: studyProgress,
         createdAt: workspaceCreatedAt,
         savedAt: Date.now(),
@@ -780,7 +793,7 @@ export default function Home() {
     lastUploadFileRef.current = file;
     setRetryAvailable(true);
 
-    const selectedOcrMode = REQUIRED_OCR_MODE;
+    const selectedOcrMode = resumedJob?.ocrMode ?? ocrMode;
     const compatibleResumedJob = isCompatibleProcessingJob(resumedJob) ? resumedJob : undefined;
     if (resumedJob && !compatibleResumedJob) {
       await storageBestEffort("delete obsolete OCR job", () => deleteProcessingJob(resumedJob.id), undefined);
@@ -813,18 +826,20 @@ export default function Home() {
 
     const cached = await storageBestEffort("read document cache", () => getCachedDocument(fingerprint), null);
     if (
-      cached?.ocrMode === REQUIRED_OCR_MODE &&
-      isCurrentFullOcrDocument(cached.documentIndex)
+      cached?.ocrMode === selectedOcrMode &&
+      isCurrentOcrDocument(cached.documentIndex, selectedOcrMode)
     ) {
       const summaries = currentWorkspaceSummaries(
         await storageBestEffort("list workspaces", listWorkspaces, []),
       );
-      const existingSummary = summaries.find((workspace) => workspace.fingerprint === fingerprint);
+      const existingSummary = summaries.find((workspace) =>
+        workspace.fingerprint === fingerprint && workspace.ocrMode === selectedOcrMode,
+      );
       const existingCandidate = existingSummary
         ? await storageBestEffort("load cached workspace", () => loadWorkspace(existingSummary.id), null)
         : null;
-      const existing = existingCandidate?.ocrMode === REQUIRED_OCR_MODE &&
-        isCurrentFullOcrDocument(existingCandidate.documentIndex)
+      const existing = existingCandidate?.ocrMode === selectedOcrMode &&
+        isCurrentOcrDocument(existingCandidate.documentIndex, selectedOcrMode)
         ? existingCandidate
         : null;
       const timestamp = Date.now();
@@ -835,7 +850,7 @@ export default function Home() {
         documentIndex: cached.documentIndex,
         messages: [],
         mode,
-        ocrMode: REQUIRED_OCR_MODE,
+        ocrMode: selectedOcrMode,
         progress: DEFAULT_PROGRESS,
         createdAt: timestamp,
         savedAt: timestamp,
@@ -863,7 +878,7 @@ export default function Home() {
           fileBlob: file.slice(0, file.size, file.type),
           status: "processing",
           error: undefined,
-          message: compatibleResumedJob.ocrManifest ? "正在从已保存的全页 OCR 阶段继续。" : "正在重新开始未完成的浏览器分析。",
+          message: compatibleResumedJob.ocrManifest ? "正在从已保存的浏览器分析阶段继续。" : "正在重新开始未完成的浏览器分析。",
           updatedAt: timestamp,
         }
       : {
@@ -949,7 +964,7 @@ export default function Home() {
         if (controller.signal.aborted || (error instanceof DOMException && error.name === "AbortError")) {
           return;
         }
-        const message = error instanceof Error ? error.message : "浏览器全页 OCR 失败，请刷新页面或更换文件后重试。";
+        const message = error instanceof Error ? error.message : "浏览器文档分析失败，请刷新页面或更换文件后重试。";
         const retryCannotHelp = /已损坏|内容与扩展名不一致|已加密|尺寸异常|最多支持|上传上限|请拆分课件/.test(message);
         markFailed({
           code: "BROWSER_OCR_FAILED",
@@ -1324,7 +1339,7 @@ export default function Home() {
   const switchWorkspace = async (id: string) => {
     if (id === workspaceId || uploadBusy) return;
     const snapshot = await loadWorkspace(id);
-    if (!snapshot || snapshot.ocrMode !== REQUIRED_OCR_MODE || !isCurrentFullOcrDocument(snapshot.documentIndex)) return;
+    if (!snapshot || !isCurrentOcrDocument(snapshot.documentIndex, snapshot.ocrMode)) return;
     await setActiveWorkspaceId(id);
     applyWorkspaceSnapshot(snapshot);
     setUploadError(null);
@@ -1464,17 +1479,45 @@ export default function Home() {
               </div>
             )}
 
-            <div className="mb-3 rounded-xl border border-blue-100 bg-blue-50 px-3 py-2.5">
-              <p className="flex items-center gap-1.5 text-xs font-semibold text-blue-800">
-                <FileText size={14} aria-hidden="true" /> 全页 OCR 已固定启用
+            <fieldset className="mb-3" disabled={uploadBusy}>
+              <legend className="mb-1.5 flex items-center gap-1.5 text-xs font-semibold text-slate-600">
+                <FileText size={14} aria-hidden="true" /> OCR 处理模式
+              </legend>
+              <div className="grid grid-cols-3 gap-1 rounded-xl bg-slate-100 p-1">
+                {([
+                  ["auto", "自动（推荐）"],
+                  ["none", "不使用 OCR"],
+                  ["force", "全页 OCR"],
+                ] as const).map(([value, label]) => (
+                  <label
+                    key={value}
+                    className={`cursor-pointer rounded-lg px-1.5 py-2 text-center text-[11px] font-semibold transition ${
+                      ocrMode === value ? "bg-white text-blue-700 shadow-sm" : "text-slate-500 hover:text-slate-700"
+                    } ${uploadBusy ? "cursor-not-allowed opacity-60" : ""}`}
+                  >
+                    <input
+                      type="radio"
+                      name="ocr-mode"
+                      value={value}
+                      checked={ocrMode === value}
+                      onChange={() => setOcrMode(value)}
+                      className="sr-only"
+                    />
+                    {label}
+                  </label>
+                ))}
+              </div>
+              <p className="mt-1.5 text-[11px] leading-4 text-slate-500">
+                {ocrMode === "auto"
+                  ? "自动识别缺少文字层的页面，并检测值得分析的图表区域。"
+                  : ocrMode === "force"
+                    ? "逐页识别全部内容，适合扫描课件，但耗时和内存占用更高。"
+                    : "只读取文件原生文字，速度最快，不会生成图片证据。"}
               </p>
-              <p className="mt-1 text-[11px] leading-4 text-blue-700/80">
-                系统会在当前浏览器逐页识别 PDF 或 PPTX，确保扫描文字也进入检索；长课件处理时间会相应增加。
+              <p className="mt-1.5 text-[10px] leading-4 text-slate-400">
+                页面分析在本机执行；提取文字、候选图表及提问证据会发送到项目服务端与已配置的千问服务，请勿上传受限材料。
               </p>
-              <p className="mt-1.5 text-[10px] leading-4 text-blue-700/70">
-                OCR 在本机执行；提取文字、候选图表及提问证据会发送到项目服务端与已配置的千问服务，请勿上传受限材料。
-              </p>
-            </div>
+            </fieldset>
 
             <label
               className={`block cursor-pointer rounded-2xl border-2 border-dashed p-4 transition ${
@@ -1584,7 +1627,7 @@ export default function Home() {
                     {documentIndex.ocr && documentIndex.ocr.mode !== "none" && (
                       <>
                         <p className="mt-1 text-[11px] text-emerald-700/80">
-                          全页 OCR · 成功 {documentIndex.ocr.successfulPageCount}/{documentIndex.ocr.totalPageCount} 页
+                          {documentIndex.ocr.mode === "auto" ? "自动 OCR" : "全页 OCR"} · 成功 {documentIndex.ocr.successfulPageCount}/{documentIndex.ocr.mode === "auto" ? documentIndex.ocr.automaticallySelectedPageCount ?? 0 : documentIndex.ocr.totalPageCount} {documentIndex.ocr.mode === "auto" ? "个选定页面" : "页"}
                           {documentIndex.ocr.averageConfidence != null ? ` · 平均置信度 ${documentIndex.ocr.averageConfidence}%` : ""}
                         </p>
                         {!!documentIndex.ocr.failedPageNumbers?.length && (
