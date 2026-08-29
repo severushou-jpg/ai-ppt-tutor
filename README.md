@@ -2,6 +2,10 @@
 
 一个基于 PDF / PPTX 课件的 AI 学习工作区。上传课件后，系统会按页或幻灯片提取文本、建立分块索引，并在讲解、问答、练习和复习模式中返回可核查的课件来源。
 
+## 在线体验
+
+[https://ai-ppt-tutor.vercel.app/](https://ai-ppt-tutor.vercel.app/)
+
 ## 本地运行
 
 环境要求：Node.js 22.13 或更高版本。
